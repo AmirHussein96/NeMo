@@ -20,7 +20,6 @@ from lhotse.cut import Cut, MixedCut
 from lhotse.utils import ifnone
 
 from nemo.collections.common.data.prompt_fn import registered_prompt_format_fn
-from nemo.collections.common.prompts.canary import BOOL_FALSE, BOOL_TRUE, PNC_FALSE, PNC_TRUE
 from nemo.collections.common.prompts.formatter import Modality, PromptFormatter
 from nemo.collections.common.tokenizers.canary_tokenizer import (
     CANARY2_BOCTX,
@@ -29,17 +28,6 @@ from nemo.collections.common.tokenizers.canary_tokenizer import (
     CANARY_SPECIAL_TOKENIZER,
     CanaryTokenizer,
 )
-
-# Use global variables to import slot values in other modules.
-ITN_TRUE = BOOL_TRUE | {
-    "itn",
-    "<|itn|>",
-}
-ITN_FALSE = BOOL_FALSE | {"noitn", "<|noitn|>"}
-TIMESTAMP_TRUE = BOOL_TRUE | {"timestamp", "<|timestamp|>"}
-TIMESTAMP_FALSE = BOOL_FALSE | {"notimestamp", "<|notimestamp|>"}
-DIARIZE_TRUE = BOOL_TRUE | {"diarize", "<|diarize|>"}
-DIARIZE_FALSE = BOOL_FALSE | {"nodiarize", "<|nodiarize|>"}
 
 
 class Canary2PromptFormatter(PromptFormatter):
@@ -62,13 +50,43 @@ class Canary2PromptFormatter(PromptFormatter):
                 # Transcription language - specified by the user.
                 "target_lang": Modality.Text,
                 # Should we predict punctuation and capitalization?
-                "pnc": Modality.TextLiteral(*(PNC_TRUE | PNC_FALSE)),
+                "pnc": Modality.TextLiteral(
+                    "yes", "no", "true", "True", "false", "False", "1", "0", "pnc", "nopnc", "<|pnc|>", "<|nopnc|>"
+                ),
                 # Should we predict with inverse text normalization (numerals as digits, abbreviations, etc.)
-                "itn": Modality.TextLiteral(*(ITN_TRUE | ITN_FALSE)),
+                "itn": Modality.TextLiteral(
+                    "yes", "no", "true", "True", "false", "False", "1", "0", "itn", "noitn", "<|itn|>", "<|noitn|>"
+                ),
                 # Should we predict timestamps?
-                "timestamp": Modality.TextLiteral(*(TIMESTAMP_TRUE | TIMESTAMP_FALSE)),
-                # # Should we diarize speech?
-                "diarize": Modality.TextLiteral(*(DIARIZE_TRUE | DIARIZE_FALSE)),
+                "timestamp": Modality.TextLiteral(
+                    "yes",
+                    "no",
+                    "true",
+                    "True",
+                    "false",
+                    "False",
+                    "1",
+                    "0",
+                    "timestamp",
+                    "notimestamp",
+                    "<|timestamp|>",
+                    "<|notimestamp|>",
+                ),
+                # Should we diarize speech?
+                "diarize": Modality.TextLiteral(
+                    "yes",
+                    "no",
+                    "true",
+                    "True",
+                    "false",
+                    "False",
+                    "1",
+                    "0",
+                    "diarize",
+                    "nodiarize",
+                    "<|diarize|>",
+                    "<|nodiarize|>",
+                ),
             },
         },
         # User prompt.

@@ -20,7 +20,6 @@ from nemo.collections.llm.gpt.model.qwen2 import (
     Qwen2Config7B,
     Qwen2Config72B,
     Qwen2Config500M,
-    Qwen25Config3B,
 )
 
 
@@ -58,15 +57,6 @@ def test_qwen2_config_1p5b():
     assert config.num_attention_heads == 12
     assert config.num_query_groups == 2
     assert config.ffn_hidden_size == 8960
-
-
-def test_qwen25_config_3B():
-    config = Qwen25Config3B()
-    assert config.num_layers == 36
-    assert config.hidden_size == 2048
-    assert config.num_attention_heads == 16
-    assert config.num_query_groups == 2
-    assert config.ffn_hidden_size == 11008
 
 
 def test_qwen2_config_7b():

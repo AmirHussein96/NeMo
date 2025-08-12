@@ -102,7 +102,7 @@ try:
 
     HAVE_MEGATRON_CORE = True
 
-except (AttributeError, ImportError, ModuleNotFoundError):
+except (ImportError, ModuleNotFoundError):
 
     TransformerConfig = ApexGuardDefaults
 
@@ -189,10 +189,7 @@ def drop_layers(model, layers_to_drop: List[int]):
 
 
 def mcore_model_customize(cfg, model):
-    assert (
-        cfg.get("virtual_pipeline_model_parallel_size", None) is None
-    ), "Virtual pipeline model parallel size is no longer supported for nemo 1.0"
-    if cfg.get("apply_embedding_scaling", False) and parallel_state.is_pipeline_first_stage():
+    if cfg.get("apply_embedding_scaling", False) and parallel_state.is_pipeline_first_stage(ignore_virtual=False):
         extend_instance(model.embedding, EmbeddingScalingMixin)
     if cfg.get("scale_positional_embedding", False):
         model.rotary_pos_emb.inv_freq = apply_rope_scaling(
@@ -578,7 +575,9 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
                 seq_len_interpolation_factor=self.cfg.get('seq_len_interpolation_factor', None),
                 rotary_base=self.cfg.get('rotary_base', 10000),
             )
-            if self.cfg.get("apply_embedding_scaling", False) and parallel_state.is_pipeline_first_stage():
+            if self.cfg.get("apply_embedding_scaling", False) and parallel_state.is_pipeline_first_stage(
+                ignore_virtual=False
+            ):
                 extend_instance(model.language_model.embedding, EmbeddingScalingMixin)
         return model
 
@@ -634,7 +633,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             # Special handling for embedding grads
             with_fp32_embedding_grads = self.cfg.get('with_fp32_embedding_grads', True)
             modules = self.get_model_module_list()
-            if parallel_state.is_pipeline_first_stage():
+            if parallel_state.is_pipeline_first_stage(ignore_virtual=True):
                 module = modules[0]  # first virtual rank has the embeddings
 
                 # Word embeddings: use FP32 grads and disable
@@ -660,7 +659,9 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
                     position_embeddings._with_fp32_optimizer = with_fp32_embedding_grads
 
             # Handle case where embeddings are used in output layer
-            if parallel_state.is_pipeline_last_stage() and self.cfg.get('share_embeddings_and_output_weights', True):
+            if parallel_state.is_pipeline_last_stage(ignore_virtual=True) and self.cfg.get(
+                'share_embeddings_and_output_weights', True
+            ):
                 module = modules[-1]  # last virtual rank has the embeddings
                 word_embeddings = (
                     module.shared_embedding_or_output_weight() if self.mcore_gpt else module.word_embeddings_weight()
@@ -888,7 +889,9 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
                     for param in module.embedding.parameters():
                         param.data_ptr()
 
-        if self.cfg.get('pipeline_model_parallel_size', 1) > 1 and parallel_state.is_pipeline_last_stage():
+        if self.cfg.get('pipeline_model_parallel_size', 1) > 1 and parallel_state.is_pipeline_last_stage(
+            ignore_virtual=True
+        ):
             if (
                 self.cfg.get('defer_embedding_wgrad_compute', False)
                 and self.mcore_gpt
@@ -911,7 +914,9 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             self.prev_step_training = self.training
 
         # Optimization: Defer the embedding GEMM Wgrads of the last PP stage to pipeline flush waiting time
-        if self.cfg.get('pipeline_model_parallel_size', 1) > 1 and parallel_state.is_pipeline_last_stage():
+        if self.cfg.get('pipeline_model_parallel_size', 1) > 1 and parallel_state.is_pipeline_last_stage(
+            ignore_virtual=True
+        ):
             if (
                 self.cfg.get('defer_embedding_wgrad_compute', False)
                 and self.mcore_gpt
@@ -979,20 +984,18 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             self.megatron_timer_stop('allreduce_first_last_embeddings')
 
         if self.log_memory_usage:
-            # maximum GPU memory that has been managed by the caching allocator
             max_memory_reserved = torch.cuda.max_memory_reserved()
-            # maximum GPU memory that has been occupied by active tensors
-            max_memory_allocated = torch.cuda.max_memory_allocated()
+            memory_allocated = torch.cuda.memory_allocated()
             self.log(
-                'max_memory_reserved',
+                'peak_memory_usage',
                 max_memory_reserved,
                 prog_bar=True,
                 rank_zero_only=True,
                 batch_size=1,
             )
             self.log(
-                'max_memory_allocated',
-                max_memory_allocated,
+                'memory_allocated',
+                memory_allocated,
                 prog_bar=True,
                 rank_zero_only=True,
                 batch_size=1,
@@ -1122,15 +1125,13 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         # This should only run for models that support pipelined model parallelism
         # (BERT and GPT-2).
         if parallel_state.get_pipeline_model_parallel_world_size() > 1 and (
-            parallel_state.is_pipeline_first_stage() or parallel_state.is_pipeline_last_stage()
+            parallel_state.is_pipeline_first_stage(ignore_virtual=True)
+            or parallel_state.is_pipeline_last_stage(ignore_virtual=True)
         ):
             module_list = self.get_model_module_list()
-            assert (
-                self.cfg.get("virtual_pipeline_model_parallel_size", None) is None
-            ), "Virtual pipeline model parallel size is no longer supported for nemo 1.0"
-            if parallel_state.is_pipeline_first_stage():
+            if parallel_state.is_pipeline_first_stage(ignore_virtual=True):
                 module = module_list[0]  # only the first virtual rank has the embeddings
-            elif parallel_state.is_pipeline_last_stage():
+            elif parallel_state.is_pipeline_last_stage(ignore_virtual=True):
                 module = module_list[-1]  # only the last virtual rank has the embeddings
             share_embeddings = (
                 module.share_embeddings_and_output_weights if self.mcore_gpt else module.share_token_embeddings
@@ -1289,9 +1290,9 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
                     required_keys.add('cu_seqlens')
                 if 'cu_seqlens_unpadded' in batch:
                     required_keys.add('cu_seqlens_unpadded')
-                if parallel_state.is_pipeline_first_stage():
+                if parallel_state.is_pipeline_first_stage(ignore_virtual=False):
                     required_keys.update(('tokens', 'position_ids'))
-                if parallel_state.is_pipeline_last_stage():
+                if parallel_state.is_pipeline_last_stage(ignore_virtual=False):
                     required_keys.update(('labels', 'loss_mask'))
             if self.get_attention_mask_from_fusion and 'attention_mask' in required_keys:
                 required_keys.remove('attention_mask')
@@ -1522,7 +1523,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             # Advance inference sequence offset.
             if self.inference_params:
                 # if last stage, then (final) output is [b, s, h], otherwise it's [s, b, h]
-                if parallel_state.is_pipeline_last_stage():
+                if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
                     self.inference_params.sequence_len_offset += output_tensor.size(1)
                 else:
                     self.inference_params.sequence_len_offset += output_tensor.size(0)
@@ -1582,10 +1583,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         return loss
 
     def on_validation_epoch_end(self):
-        assert (
-            self.cfg.get("virtual_pipeline_model_parallel_size", None) is None
-        ), "Virtual pipeline model parallel size is no longer supported for nemo 1.0"
-        if parallel_state.is_pipeline_last_stage():
+        if parallel_state.is_pipeline_last_stage(ignore_virtual=False):
             # only the last pipeline parallel stages return loss with their batch size
             if self.validation_drop_last:
                 averaged_loss = torch.stack(self.validation_step_outputs).mean()
@@ -1988,10 +1986,13 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         if self.mcore_gpt and not self.use_fsdp:
             checkpoint['sharded_state_dict'] = self.sharded_state_dict()
 
+        # legacy checkpointing for interleaved
         else:
             if isinstance(self.model, list):
                 for i in range(len(self.model)):
+                    parallel_state.set_virtual_pipeline_model_parallel_rank(i)
                     checkpoint[f'model{i}'] = self.model[i].module.state_dict_for_save_checkpoint()
+                parallel_state.set_virtual_pipeline_model_parallel_rank(0)
 
     def on_load_checkpoint(self, checkpoint) -> None:
         """LightningModule hook:
@@ -2028,10 +2029,13 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
                 # see NLPModel.on_load_checkpoint
                 checkpoint['state_dict'] = {}
 
+        # legacy checkpointing for interleaved
         else:
             if isinstance(self.model, list):
                 for i in range(len(self.model)):
+                    parallel_state.set_virtual_pipeline_model_parallel_rank(i)
                     self.model[i].module.load_state_dict(checkpoint[f'model{i}'], strict=True)
+                parallel_state.set_virtual_pipeline_model_parallel_rank(0)
 
     def on_validation_model_zero_grad(self) -> None:
         """
@@ -2054,11 +2058,17 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             sharded_state_dict = {}
             for index, module in enumerate(self.get_model_module_list()):
                 if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
+                    # virtual pipline rank must be set so that GPTModel returns the correct sharded state dict
+                    parallel_state.set_virtual_pipeline_model_parallel_rank(index)
                     module_sharded_state_dict = module.sharded_state_dict(prefix=module_prefix)
                     sharded_state_dict[f'model_{index}'] = module_sharded_state_dict
                 else:
                     module_sharded_state_dict = module.sharded_state_dict(prefix=module_prefix)
                     sharded_state_dict.update(module_sharded_state_dict)
+
+            # reset vp rank
+            if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
+                parallel_state.set_virtual_pipeline_model_parallel_rank(0)
 
             # WAR: This is a temporary fix to skip loading FP8 parameters for Dot Product Attention
             def skip_fp8_load(x):
@@ -2088,12 +2098,16 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         if parallel_state.get_pipeline_model_parallel_world_size() > 1:
             if self.cfg.get('share_embeddings_and_output_weights', True):
                 for index, module in enumerate(self.get_model_module_list()):
+                    if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
+                        parallel_state.set_virtual_pipeline_model_parallel_rank(index)
                     sync_embeddings = (
                         module.setup_embeddings_and_output_layer
                         if self.mcore_gpt
                         else module.sync_initial_word_embeddings
                     )
                     sync_embeddings()
+                if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
+                    parallel_state.set_virtual_pipeline_model_parallel_rank(0)
 
     def _reset_activation_checkpointing_args(self):
         """Disables activation checkpointing completely and saves the values so that

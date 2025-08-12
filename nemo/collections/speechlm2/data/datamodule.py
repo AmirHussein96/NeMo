@@ -16,7 +16,6 @@ from lightning import LightningDataModule
 from lightning.pytorch.utilities import CombinedLoader
 from omegaconf import DictConfig, OmegaConf, open_dict
 
-from nemo.collections.common.data.fallback import FallbackDataset
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
 from nemo.collections.common.tokenizers import TokenizerSpec
 
@@ -76,7 +75,7 @@ class DataModule(LightningDataModule):
             config=self.cfg.train_ds,
             global_rank=self._get_dp_rank(),
             world_size=self._get_world_size(),
-            dataset=FallbackDataset(self.dataset),
+            dataset=self.dataset,
             tokenizer=self.tokenizer,
         )
 

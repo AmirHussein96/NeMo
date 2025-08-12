@@ -108,19 +108,13 @@ class GemmaModel(GPTModel):
         """ """
         super().__init__(config or GemmaConfig(), optim=optim, tokenizer=tokenizer, model_transform=model_transform)
 
-    def configure_model(self, vp_stage: Optional[int] = None):
+    def configure_model(self):
         """ """
         from nemo.collections.common.parts.utils import extend_instance
         from nemo.collections.llm.gpt.model.gemma2 import EmbeddingScalingMixin
 
-        super().configure_model(vp_stage=vp_stage)
-        # During fake lightning initialization, pass 0 to bypass the assertion that vp_stage must be
-        # non-None when using virtual pipeline model parallelism
-        vp_stage = vp_stage or 0
-        if parallel_state.is_pipeline_first_stage(
-            ignore_virtual=False,
-            vp_stage=vp_stage,
-        ):
+        super().configure_model()
+        if parallel_state.is_pipeline_first_stage(ignore_virtual=False):
             extend_instance(self.module.embedding, EmbeddingScalingMixin)
 
 
@@ -281,7 +275,7 @@ class HFGemmaExporter(io.ModelConnector[GemmaModel, "GemmaForCausalLM"]):
     @property
     def config(self) -> "GemmaConfig":
         """ """
-        source: GemmaConfig = io.load_context(str(self), subpath="model.config")
+        source: GemmaConfig = io.load_context(str(self)).model.config
 
         from transformers import GemmaConfig as HFGemmaConfig
 

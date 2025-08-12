@@ -43,14 +43,8 @@ def idempotent_path_append(base_dir: Union[str, Path], suffix) -> Path:
         Path: The updated path object with the suffix appended if it was not already present.
     """
     from nemo.lightning.resume import AdapterPath
-    from nemo.utils.msc_utils import import_multistorageclient, is_multistorageclient_url
 
-    if is_multistorageclient_url(base_dir):
-        msc = import_multistorageclient()
-        base_dir = msc.Path(base_dir)
-    else:
-        base_dir = Path(base_dir)
-
+    assert isinstance(base_dir, Path)
     if base_dir.parts[-1] != suffix:
         base_dir = base_dir / suffix
     if isinstance(base_dir, AdapterPath) and base_dir.base_model_path.parts[-1] != suffix:
@@ -70,17 +64,10 @@ def ckpt_to_dir(filepath: Union[str, Path]) -> Path:
     to be used as a directory for distributed checkpoints
     """
     from nemo.lightning.resume import AdapterPath
-    from nemo.utils.msc_utils import import_multistorageclient, is_multistorageclient_url
 
     if isinstance(filepath, AdapterPath):
         return filepath
-
-    if is_multistorageclient_url(filepath):
-        msc = import_multistorageclient()
-        filepath = msc.Path(filepath)
-    else:
-        filepath = Path(filepath)
-
+    filepath = Path(filepath)
     if not filepath.suffix == ".ckpt":
         filepath = filepath.with_suffix(filepath.suffix + ".ckpt")
 

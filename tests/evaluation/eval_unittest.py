@@ -53,8 +53,7 @@ def test_default_none_tokenizer():
     assert eval_config.params.extra["num_fewshot"] == 5
 
 
-@pytest.mark.parametrize("task", ["gsm8k", "lm-evaluation-harness.gsm8k", "lm_evaluation_harness.gsm8k"])
-def test_evaluation(httpserver: HTTPServer, task: str):
+def test_evaluation(httpserver: HTTPServer):
     httpserver.expect_request("/v1/triton_health").respond_with_json(
         {"status": "Triton server is reachable and ready"}
     )
@@ -76,8 +75,10 @@ def test_evaluation(httpserver: HTTPServer, task: str):
         api_endpoint={"url": "http://localhost:8000/v1/completions/", "type": "completions"}
     )
     eval_config = EvaluationConfig(
-        type=task,
-        params=ConfigParams(limit_samples=1, parallelism=1),
+        type="gsm8k",
+        params=ConfigParams(
+            extra={"tokenizer": "Qwen/Qwen2.5-0.5B", "num_fewshot": 13}, limit_samples=1, parallelism=1
+        ),
     )
 
     results = evaluate(target_cfg=target_config, eval_cfg=eval_config)

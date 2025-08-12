@@ -26,6 +26,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -33,13 +34,11 @@ import torch
 from tqdm import tqdm
 
 from nemo.collections.asr.modules import rnnt_abstract
-from nemo.collections.asr.parts.submodules.ngram_lm import NGramGPULanguageModel
 from nemo.collections.asr.parts.submodules.rnnt_beam_decoding import pack_hypotheses
 from nemo.collections.asr.parts.submodules.tdt_malsd_batched_computer import ModifiedALSDBatchedTDTComputer
 from nemo.collections.asr.parts.utils.asr_confidence_utils import ConfidenceMethodMixin
-from nemo.collections.asr.parts.utils.batched_beam_decoding_utils import BlankLMScoreMode, PruningMode
+from nemo.collections.asr.parts.utils.rnnt_batched_beam_utils import BlankLMScoreMode, PruningMode
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis, NBestHypotheses, is_prefix
-from nemo.collections.common.parts.optional_cuda_graphs import WithOptionalCudaGraphs
 from nemo.core.classes import Typing, typecheck
 from nemo.core.neural_types import AcousticEncodedRepresentation, HypothesisType, LengthsType, NeuralType
 from nemo.utils import logging
@@ -267,8 +266,14 @@ class BeamTDTInfer(Typing):
         if ngram_lm_model:
             if search_type != "maes":
                 raise ValueError("For decoding with language model `maes` decoding strategy must be chosen.")
-            self.ngram_lm = ngram_lm_model
-            self.ngram_lm_alpha = ngram_lm_alpha
+
+            if KENLM_AVAILABLE:
+                self.ngram_lm = kenlm.Model(ngram_lm_model)
+                self.ngram_lm_alpha = ngram_lm_alpha
+            else:
+                raise ImportError(
+                    "KenLM package (https://github.com/kpu/kenlm) is not installed. " "Use ngram_lm_model=None."
+                )
         else:
             self.ngram_lm = None
 
@@ -824,7 +829,7 @@ class BeamTDTInfer(Typing):
             return sorted(hyps, key=lambda x: x.score, reverse=True)
 
 
-class BeamBatchedTDTInfer(Typing, ConfidenceMethodMixin, WithOptionalCudaGraphs):
+class BeamBatchedTDTInfer(Typing, ConfidenceMethodMixin):
     @property
     def input_types(self):
         """Returns definitions of module input ports."""
@@ -845,8 +850,8 @@ class BeamBatchedTDTInfer(Typing, ConfidenceMethodMixin, WithOptionalCudaGraphs)
         score_norm: bool = True,
         max_symbols_per_step: Optional[int] = None,
         preserve_alignments: bool = False,
-        fusion_models: Optional[List[NGramGPULanguageModel]] = None,
-        fusion_models_alpha: Optional[List[float]] = None,
+        ngram_lm_model: Optional[str | Path] = None,
+        ngram_lm_alpha: float = 0.0,
         blank_lm_score_mode: Optional[str | BlankLMScoreMode] = BlankLMScoreMode.NO_SCORE,
         pruning_mode: Optional[str | PruningMode] = PruningMode.EARLY,
         allow_cuda_graphs: Optional[bool] = True,
@@ -862,8 +867,8 @@ class BeamBatchedTDTInfer(Typing, ConfidenceMethodMixin, WithOptionalCudaGraphs)
             beam_size: beam size
             max_symbols_per_step: max symbols to emit on each step (to avoid infinite looping)
             preserve_alignments: if alignments are needed
-            fusion_models: list of fusion models to use for decoding
-            fusion_models_alpha: list of alpha values for fusion models
+            ngram_lm_model: path to the NGPU-LM n-gram LM model: .arpa or .nemo formats
+            ngram_lm_alpha: weight for the n-gram LM scores
             blank_lm_score_mode: mode for scoring blank symbol with LM
             pruning_mode: mode for pruning hypotheses with LM
             allow_cuda_graphs: whether to allow CUDA graphs
@@ -896,26 +901,14 @@ class BeamBatchedTDTInfer(Typing, ConfidenceMethodMixin, WithOptionalCudaGraphs)
                 blank_index=self._blank_index,
                 max_symbols_per_step=self.max_symbols,
                 preserve_alignments=preserve_alignments,
-                fusion_models=fusion_models,
-                fusion_models_alpha=fusion_models_alpha,
+                ngram_lm_model=ngram_lm_model,
+                ngram_lm_alpha=ngram_lm_alpha,
                 blank_lm_score_mode=blank_lm_score_mode,
                 pruning_mode=pruning_mode,
                 allow_cuda_graphs=allow_cuda_graphs,
             )
         else:
             raise Exception(f"Decoding strategy {search_type} nor implemented.")
-
-    def disable_cuda_graphs(self) -> bool:
-        """Disable CUDA graphs (e.g., for decoding in training)"""
-        if isinstance(self._decoding_computer, WithOptionalCudaGraphs):
-            return self._decoding_computer.disable_cuda_graphs()
-        return False
-
-    def maybe_enable_cuda_graphs(self) -> bool:
-        """Enable CUDA graphs (if allowed)"""
-        if isinstance(self._decoding_computer, WithOptionalCudaGraphs):
-            return self._decoding_computer.maybe_enable_cuda_graphs()
-        return False
 
     @property
     def output_types(self):

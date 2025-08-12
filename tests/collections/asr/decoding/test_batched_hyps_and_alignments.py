@@ -19,7 +19,18 @@ import pytest
 import torch
 
 from nemo.collections.asr.parts.utils.rnnt_utils import BatchedAlignments, BatchedHyps, batched_hyps_to_hypotheses
-from tests.collections.asr.decoding.utils import avoid_sync_operations
+
+
+@contextmanager
+def avoid_sync_operations(device: torch.device):
+    try:
+        if device.type == "cuda":
+            torch.cuda.set_sync_debug_mode(2)  # fail if a blocking operation
+        yield
+    finally:
+        if device.type == "cuda":
+            torch.cuda.set_sync_debug_mode(0)  # default, blocking operations are allowed
+
 
 DEVICES: List[torch.device] = [torch.device("cpu")]
 
@@ -373,12 +384,12 @@ class TestConvertToHypotheses:
             scores=torch.tensor([1.0, 1.0], device=device),
         )
         hypotheses = batched_hyps_to_hypotheses(hyps)
-        assert (hypotheses[0].y_sequence == torch.tensor([5, 2], device="cpu")).all()
-        assert (hypotheses[1].y_sequence == torch.tensor([4], device="cpu")).all()
+        assert (hypotheses[0].y_sequence == torch.tensor([5, 2], device=device)).all()
+        assert (hypotheses[1].y_sequence == torch.tensor([4], device=device)).all()
         assert hypotheses[0].score == pytest.approx(1.5)
         assert hypotheses[1].score == pytest.approx(1.0)
-        assert (hypotheses[0].timestamp == torch.tensor([1, 1], device="cpu")).all()
-        assert (hypotheses[1].timestamp == torch.tensor([2], device="cpu")).all()
+        assert (hypotheses[0].timestamp == torch.tensor([1, 1], device=device)).all()
+        assert (hypotheses[1].timestamp == torch.tensor([2], device=device)).all()
 
     @pytest.mark.unit
     @pytest.mark.parametrize("device", DEVICES)
@@ -433,12 +444,12 @@ class TestConvertToHypotheses:
         )
 
         hypotheses = batched_hyps_to_hypotheses(hyps, alignments)
-        assert (hypotheses[0].y_sequence == torch.tensor([5, 2], device="cpu")).all()
-        assert (hypotheses[1].y_sequence == torch.tensor([4], device="cpu")).all()
+        assert (hypotheses[0].y_sequence == torch.tensor([5, 2], device=device)).all()
+        assert (hypotheses[1].y_sequence == torch.tensor([4], device=device)).all()
         assert hypotheses[0].score == pytest.approx(1.5)
         assert hypotheses[1].score == pytest.approx(1.0)
-        assert (hypotheses[0].timestamp == torch.tensor([0, 1], device="cpu")).all()
-        assert (hypotheses[1].timestamp == torch.tensor([1], device="cpu")).all()
+        assert (hypotheses[0].timestamp == torch.tensor([0, 1], device=device)).all()
+        assert (hypotheses[1].timestamp == torch.tensor([1], device=device)).all()
 
         etalon = [
             [

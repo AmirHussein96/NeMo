@@ -349,8 +349,6 @@ class Llama4ViTModel(VisionModule):
             spec=transformer_layer_spec,
             pre_process=True,
             post_process=False,
-            # Hardcode vp_stage=0 since ViT models don't support virtual pipeline parallelism
-            vp_stage=0,
         )
         self.adapter = PixelShuffleMLP(
             config=transformer_config,

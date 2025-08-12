@@ -209,10 +209,12 @@ class MegatronParallel(nn.ModuleList, Generic[ModelT]):
             if len(_pipeline) == 1 and parallel_state.get_pipeline_model_parallel_world_size() > 1:
                 from nemo.lightning import io
 
+                parallel_state.set_virtual_pipeline_model_parallel_world_size(vp_size)
                 for i in range(1, vp_size):
+                    parallel_state.set_virtual_pipeline_model_parallel_rank(i)
                     _model = io.reinit(_pipeline[0])
                     if hasattr(_model, "configure_model"):
-                        _model.configure_model(vp_stage=i)
+                        _model.configure_model()
                     _pipeline.append(_model)
 
         super().__init__(_pipeline)
@@ -225,7 +227,6 @@ class MegatronParallel(nn.ModuleList, Generic[ModelT]):
         self.ddp_config = ddp_config
         self.fsdp = fsdp
         self.convert_module_fn = convert_module_fn
-        self.vp_size = vp_size
 
     def forward(
         self,
@@ -504,9 +505,7 @@ class MegatronParallel(nn.ModuleList, Generic[ModelT]):
                 forward_callback=forward_callback,
             )
 
-            if self.precision_plugin and parallel_state.is_pipeline_first_stage(
-                ignore_virtual=False, vp_stage=getattr(model.module, 'vp_stage', None)
-            ):
+            if self.precision_plugin and parallel_state.is_pipeline_first_stage(ignore_virtual=False):
                 batch = self.precision_plugin.convert_input(batch)
 
             output_tensor = _forward_step(model, batch)
@@ -520,9 +519,7 @@ class MegatronParallel(nn.ModuleList, Generic[ModelT]):
                 tensor=output_tensor,
             )
 
-            if self.precision_plugin and parallel_state.is_pipeline_last_stage(
-                ignore_virtual=False, vp_stage=getattr(model.module, 'vp_stage', None)
-            ):
+            if self.precision_plugin and parallel_state.is_pipeline_last_stage(ignore_virtual=False):
                 output_tensor = self.precision_plugin.convert_output(output_tensor)
 
             self.callbacks.event(
@@ -702,6 +699,8 @@ class MegatronParallel(nn.ModuleList, Generic[ModelT]):
         return output_tensor
 
     def sharded_state_dict(self, prefix: str = "") -> Dict[str, Any]:
+        from megatron.core import parallel_state
+
         """
         Creates the sharded state dict which is used by dist_checkpoint to save the sharded tensors to disk.
         When given the sharded_stated_dict, dist_checkpoint.load will load the tensors corresponding to
@@ -710,12 +709,18 @@ class MegatronParallel(nn.ModuleList, Generic[ModelT]):
         """
         sharded_state_dict = {}
         for index, module in enumerate(self):
-            if self.vp_size is not None:
+            if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
+                # virtual pipline rank must be set so that GPTModel returns the correct sharded state dict
+                parallel_state.set_virtual_pipeline_model_parallel_rank(index)
                 module_sharded_state_dict = self._module_sharded_state_dict(module)
                 sharded_state_dict[f"model_{index}"] = module_sharded_state_dict
             else:
                 module_sharded_state_dict = self._module_sharded_state_dict(module)
                 sharded_state_dict.update(module_sharded_state_dict)
+
+        # reset vp rank
+        if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
+            parallel_state.set_virtual_pipeline_model_parallel_rank(0)
 
         return sharded_state_dict
 
@@ -799,7 +804,7 @@ class _ModuleStepFunction:
     def from_forward_step(cls, module: "pl.LightningModule", step_type: str) -> Optional["_ModuleStepFunction"]:
         from megatron.core import parallel_state
 
-        if parallel_state.is_pipeline_last_stage(ignore_virtual=False, vp_stage=getattr(module, 'vp_stage', None)):
+        if parallel_state.is_pipeline_last_stage(ignore_virtual=False):
             if not hasattr(module, f"{step_type}_step"):
                 raise ValueError(f"LightningModule does not have {step_type}_step method")
 

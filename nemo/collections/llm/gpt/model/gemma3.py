@@ -21,14 +21,16 @@ from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Callable, Optional, Tuple, Union
 
+import torch
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.transformer import ModuleSpec, TransformerConfig, TransformerLayer, TransformerLayerSubmodules
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
-from megatron.core.transformer.enums import AttnBackend, AttnMaskType
+from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from torch import Tensor, nn
 
@@ -142,8 +144,6 @@ class Gemma3Config(GPTConfig):
     interleaved_attn_pattern: tuple = (5, 1)  # (local, global)
     attention_dropout: float = 0.0
     hidden_dropout: float = 0.0
-    # Disable cuDNN attention since TE 1.8 does not support head dim > 128
-    attention_backend: AttnBackend = AttnBackend.flash
 
     # mlp
     gated_linear_unit: bool = True
@@ -157,25 +157,15 @@ class Gemma3Config(GPTConfig):
     transformer_layer_spec: Union[ModuleSpec, Callable[["GPTConfig"], ModuleSpec]] = gemma3_layer_spec
     scatter_embedding_sequence_parallel: bool = True
 
-    def configure_model(
-        self,
-        tokenizer,
-        pre_process=None,
-        post_process=None,
-        vp_stage: Optional[int] = None,
-    ) -> "MCoreGPTModel":
+    def configure_model(self, tokenizer, pre_process=None, post_process=None) -> "MCoreGPTModel":
         """Configure and instantiate a megatron-core Gemma3 model."""
         if self.context_parallel_size > 1:
             raise ValueError("Context Parallel is not supported for Gemma3 model.")
 
-        assert (
-            getattr(self, "virtual_pipeline_model_parallel_size", None) is None and vp_stage is None
-        ), "Virtual pipeline model parallel size is not yet supported for Gemma3 model."
-
         rotary_base_local, rotary_base_global = self.rotary_base
         # Trick megatron's RotaryEmbedding to initialize the model successfully
         self.rotary_base = rotary_base_global
-        model = super().configure_model(tokenizer, pre_process, post_process, vp_stage=vp_stage)
+        model = super().configure_model(tokenizer, pre_process, post_process)
         self.rotary_base = (rotary_base_local, rotary_base_global)
 
         # Replace model's embedding and rope with customized ones
@@ -308,11 +298,17 @@ class Gemma3RotaryEmbedding(RotaryEmbedding):
 
     def __init__(
         self,
+        kv_channels: int,
+        rotary_percent: float = 1.0,
+        rotary_interleaved: bool = False,
+        seq_len_interpolation_factor: float = None,
         rope_scaling: bool = False,
+        use_cpu_initialization: bool = False,
+        cp_group: Optional[torch.distributed.ProcessGroup] = None,
+        *,
         rope_scaling_factor: float = 8.0,
         rotary_base: int = 1_000_000,
         rotary_base_local: int = 10_000,
-        **kwargs,
     ):
         # The rope scaling in RotaryEmbedding is not linear scaling,
         # so this flag must be off. Will calculate linear scaling below.
@@ -320,17 +316,29 @@ class Gemma3RotaryEmbedding(RotaryEmbedding):
 
         # Get inv_freq for global attention layers
         super().__init__(
-            rope_scaling=rope_scaling,
+            kv_channels=kv_channels,
+            rotary_percent=rotary_percent,
+            rotary_interleaved=rotary_interleaved,
+            seq_len_interpolation_factor=seq_len_interpolation_factor,
             rotary_base=rotary_base,
-            **kwargs,
+            rope_scaling=rope_scaling,
+            rope_scaling_factor=rope_scaling_factor,
+            use_cpu_initialization=use_cpu_initialization,
+            cp_group=cp_group,
         )
         self.inv_freq /= rope_scaling_factor
 
         # Setup Rotary Embedding for local attentions
         self.rope_local = RotaryEmbedding(
-            rope_scaling=rope_scaling,
+            kv_channels=kv_channels,
+            rotary_percent=rotary_percent,
+            rotary_interleaved=rotary_interleaved,
+            seq_len_interpolation_factor=seq_len_interpolation_factor,
             rotary_base=rotary_base_local,
-            **kwargs,
+            rope_scaling=rope_scaling,
+            rope_scaling_factor=rope_scaling_factor,
+            use_cpu_initialization=use_cpu_initialization,
+            cp_group=cp_group,
         )
 
     @lru_cache(maxsize=32)
@@ -408,7 +416,11 @@ class Gemma3TEDotProductAttention(TEDotProductAttention):
         attn_mask_type: AttnMaskType,
         attention_type: str,
         attention_dropout: Optional[float] = None,
-        **kwargs,
+        softmax_scale: Optional[float] = None,
+        k_channels: Optional[int] = None,
+        v_channels: Optional[int] = None,
+        cp_comm_type: str = "p2p",
+        model_comm_pgs: ModelCommProcessGroups = None,
     ):
         # Overwrite config.window_size based on layer_number
         config = copy.deepcopy(config)
@@ -429,7 +441,11 @@ class Gemma3TEDotProductAttention(TEDotProductAttention):
             attn_mask_type=attn_mask_type,
             attention_type=attention_type,
             attention_dropout=attention_dropout,
-            **kwargs,
+            softmax_scale=softmax_scale,
+            k_channels=k_channels,
+            v_channels=v_channels,
+            cp_comm_type=cp_comm_type,
+            model_comm_pgs=model_comm_pgs,
         )
 
 
@@ -543,7 +559,7 @@ class HFGemma3Exporter(io.ModelConnector[Gemma3Model, "Gemma3ForCausalLM"]):
         from transformers.modeling_utils import no_init_weights
 
         with no_init_weights():
-            return Gemma3ForCausalLM._from_config(self.config)
+            return Gemma3ForCausalLM.from_config(self.config)
 
     def apply(self, output_path: Path) -> Path:
         # pylint: disable=C0115,C0116
@@ -606,7 +622,7 @@ class HFGemma3Exporter(io.ModelConnector[Gemma3Model, "Gemma3ForCausalLM"]):
     @property
     def config(self):
         # pylint: disable=C0115,C0116
-        source: Gemma3Config = io.load_context(str(self), subpath="model.config")
+        source: Gemma3Config = io.load_context(str(self)).model.config
 
         from transformers import Gemma3TextConfig as HFGemma3TextConfig
 
@@ -622,7 +638,7 @@ class HFGemma3Exporter(io.ModelConnector[Gemma3Model, "Gemma3ForCausalLM"]):
             initializer_range=source.init_method_std,
             rms_norm_eps=source.layernorm_epsilon,
             num_key_value_heads=source.num_query_groups,
-            vocab_size=source.vocab_size,
+            vocab_size=self.tokenizer.vocab_size,
             rope_theta=source.rotary_base[1],
             rope_local_base_freq=source.rotary_base[0],
         )

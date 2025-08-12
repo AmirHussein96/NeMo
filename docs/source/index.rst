@@ -22,7 +22,11 @@ NVIDIA NeMo Framework is an end-to-end, cloud-native framework designed to build
 
 * :doc:`Automatic Speech Recognition (ASR) <asr/intro>`
 
+* :doc:`Multimodal Models (MMs) <multimodal/mllm/intro>`
+
 * :doc:`Text-to-Speech (TTS) <tts/intro>`
+
+* :doc:`Computer Vision (CV)  <vision/intro>`
 
 Each collection consists of prebuilt modules that include everything needed to train on your data.
 Every module can easily be customized, extended, and composed to create new generative AI
@@ -67,8 +71,7 @@ For more information, browse the developer docs for your area of interest in the
    :name: evaluation
    :titlesonly:
 
-   evaluation/evaluation-doc
-   evaluation/evaluation-adapters
+   evaluation/evaluation-doc.rst
 
 .. toctree::
    :maxdepth: 1

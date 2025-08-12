@@ -34,12 +34,12 @@ from megatron.core.transformer.utils import sharded_state_dict_default
 
 from nemo.collections.llm.gpt.model.megatron.hyena.hyena_config import HyenaConfig
 from nemo.collections.llm.gpt.model.megatron.hyena.hyena_utils import (
-    B2BCausalConv1dModule,
-    ParallelCausalDepthwiseConv1dWithState,
+    ParallelCausalDepthwiseConv1d,
     ParallelHyenaOperator,
     ParallelShortHyenaOperator,
     divide,
 )
+
 
 logger = logging.getLogger(__name__)
 
@@ -65,11 +65,6 @@ except ImportError:
 
     te = _te()  # if a user accesses anything in this module, an error will be raised
     logger.warning("WARNING: transformer_engine not installed. Using default recipe.")
-
-try:
-    from cuhyena.rearrange import rearrange as cuhyena_rearrange
-except ImportError:
-    cuhyena_rearrange = None
 
 
 def set_format_recipe():
@@ -109,9 +104,6 @@ class HyenaMixer(MegatronModule):
 
         self.fast_conv_proj = self.hyena_config.fast_conv_proj
         self.fast_conv_mixer = self.hyena_config.fast_conv_mixer
-
-        # Use b2b causal conv1d
-        self.use_b2b_causal_conv1d = self.transformer_config.use_b2b_causal_conv1d
 
         # Per attention head and per partition values.
         assert torch.distributed.is_initialized()
@@ -164,14 +156,13 @@ class HyenaMixer(MegatronModule):
 
         hyena_proj_groups = self.proj_groups if not self.grouped_attention else 1
         grouped_proj_size = self.hidden_size_per_partition // hyena_proj_groups
-
-        self.hyena_proj_conv = ParallelCausalDepthwiseConv1dWithState(
+        self.hyena_proj_conv = ParallelCausalDepthwiseConv1d(
             self.hidden_size_per_partition + 2 * grouped_proj_size,
             self.transformer_config,
             self.hyena_config,
             kernel_size=self.hyena_config.short_conv_L,
             init_method=transformer_config.init_method,
-            bias=False,  # bias not currently supported (self.hyena_config.conv_proj_bias),
+            bias=self.hyena_config.conv_proj_bias,
             use_fast_causal_conv=self.fast_conv_proj,
         )
 
@@ -184,19 +175,10 @@ class HyenaMixer(MegatronModule):
                 self.transformer_config,
                 self.hyena_config,
                 self.transformer_config.init_method,
-                short_conv_class=ParallelCausalDepthwiseConv1dWithState,
+                short_conv_class=ParallelCausalDepthwiseConv1d,
                 use_fast_causal_conv=self.fast_conv_mixer,
                 use_conv_bias=self.transformer_config.use_short_conv_bias,
             )
-
-            if self.use_b2b_causal_conv1d:
-                # Create a wrapper module that doesn't register parameters
-                # Use the existing weights from the original model
-                self.b2b_kernel = B2BCausalConv1dModule(
-                    self.hyena_proj_conv,
-                    self.mixer,
-                    operator_type=self.operator_type,
-                )
 
         if self.operator_type in [
             "hyena",
@@ -216,15 +198,6 @@ class HyenaMixer(MegatronModule):
                 operator_type,
                 max_sequence_length,
             )
-
-            if self.use_b2b_causal_conv1d and self.operator_type == "hyena_medium_conv":
-                # Create a wrapper module that doesn't register parameters
-                # Use the existing weights from the original model
-                self.b2b_kernel = B2BCausalConv1dModule(
-                    self.hyena_proj_conv,
-                    self.mixer,
-                    operator_type=self.operator_type,
-                )
 
         # Dropout. Note that for a single iteration, this layer will generate
         # different outputs on different number of parallel partitions but
@@ -250,7 +223,7 @@ class HyenaMixer(MegatronModule):
         sharded_state_dict = {}
         # Submodules
         for name, module in self.named_children():
-            if name != 'attention_dropout' and name != 'b2b_kernel':  # Don't register b2b_kernel (it's a wrapper)
+            if name != 'attention_dropout':
                 module_sharded_sd = sharded_state_dict_default(module, f'{prefix}{name}.', sharded_offsets, metadata)
 
                 sharded_state_dict.update(module_sharded_sd)
@@ -285,55 +258,16 @@ class HyenaMixer(MegatronModule):
             _proj_use_cp = True
         else:
             _proj_use_cp = False
-        # Handle padding for FP8 if enabled
-        if self.transformer_config.vortex_style_fp8:
+        features, _ = self._maybe_use_fp8(self.dense_projection, x)
+        features = rearrange(features, "l b d -> b d l").contiguous()
+        features = self.hyena_proj_conv(features, _use_cp=_proj_use_cp)  # [B, D, L]
 
-            def pad_to_multiple(x, multiple=16):
-                """Pad tensor to make sequence length divisible by multiple."""
-                seq_len = x.size(0)
-                if seq_len % multiple == 0:
-                    return x
+        x1, x2, v = rearrange(features, "b (g dg p) l -> b (g dg) p l", p=3, g=self.num_groups_per_tp_rank).unbind(
+            dim=2
+        )
 
-                pad_len = multiple - (seq_len % multiple)
-                pad_tensor = torch.zeros(pad_len, *x.shape[1:], device=x.device, dtype=x.dtype)
-                return torch.cat([x, pad_tensor], dim=0)
+        z = self.mixer(x1, x2, v, _hyena_use_cp=_proj_use_cp)
+        z = rearrange(z, "b d l -> l b d").contiguous()
 
-            # Direct padding without rearrange
-            L = x.shape[0]
-            x = pad_to_multiple(x)
-            features, _ = self._maybe_use_fp8(self.dense_projection, x)
-
-            # Slice back to original sequence length if padding was added
-
-            if features.shape[0] > L:
-                features = features[:L, :, :]
-        else:
-            features, _ = self.dense_projection(x)
-        if cuhyena_rearrange is not None:
-            features = cuhyena_rearrange(features, bhl_to_lbh=False)
-        else:
-            features = rearrange(features, "l b d -> b d l").contiguous()
-
-        if (
-            self.use_b2b_causal_conv1d
-            and self.operator_type in ["hyena_short_conv", "hyena_medium_conv"]
-            and inference_context is None
-        ):
-            # todo: support inference_context for b2b_kernel
-            # Use the B2BCausalConv1dModule wrapper with the existing weights from the original model
-            z = self.b2b_kernel(features, _use_cp=_proj_use_cp)
-        else:
-            features = self.hyena_proj_conv(
-                features, _use_cp=_proj_use_cp, inference_context=inference_context
-            )  # [B, D, L]
-            x1, x2, v = rearrange(features, "b (g dg p) l -> b (g dg) p l", p=3, g=self.num_groups_per_tp_rank).unbind(
-                dim=2
-            )
-            z = self.mixer(x1, x2, v, _hyena_use_cp=_proj_use_cp, inference_context=inference_context)
-
-        if cuhyena_rearrange is not None:
-            z = cuhyena_rearrange(z, bhl_to_lbh=True)
-        else:
-            z = rearrange(z, "b d l -> l b d").contiguous()
         y, bias = self.dense(z)
         return y, bias

@@ -57,23 +57,29 @@ app = FastAPI()
 triton_settings = TritonSettings()
 
 
-class BaseRequest(BaseModel):
+class CompletionRequest(BaseModel):
     """
-    Common parameters for completions and chat requests for the server.
+    Represents a request for text completion.
 
     Attributes:
         model (str): The name of the model to use for completion.
+        prompt (str): The input text to generate a response from.
+        messages (list[dict]): A list of message dictionaries for chat completion.
         max_tokens (int): The maximum number of tokens to generate in the response.
         temperature (float): Sampling temperature for randomness in generation.
         top_p (float): Cumulative probability for nucleus sampling.
         top_k (int): Number of highest-probability tokens to consider for sampling.
+        logprobs (int): Number of log probabilities to include in the response, if applicable.
     """
 
     model: str
+    prompt: str = 'hello'
+    messages: list[dict] = [{}]
     max_tokens: int = 512
     temperature: float = 1.0
     top_p: float = 0.0
     top_k: int = 0
+    logprobs: int = None
 
     @model_validator(mode='after')
     def set_greedy_params(self):
@@ -82,35 +88,6 @@ class BaseRequest(BaseModel):
             logging.warning("Both temperature and top_p are 0. Setting top_k to 1 to ensure greedy sampling.")
             self.top_k = 1
         return self
-
-
-class CompletionRequest(BaseRequest):
-    """
-    Represents a request for text completion.
-
-    Attributes:
-        prompt (str): The input text to generate a response from.
-        logprobs (int): Number of log probabilities to include in the response, if applicable.
-        echo (bool): Whether to return the input text as part of the response.
-    """
-
-    prompt: str
-    logprobs: int = None
-    echo: bool = False
-
-
-class ChatCompletionRequest(BaseRequest):
-    """
-    Represents a request for chat completion.
-
-    Attributes:
-        messages (list[dict]): A list of message dictionaries for chat completion.
-        logprobs (bool): Whether to return log probabilities for output tokens.
-        top_logprobs (int): Number of log probabilities to include in the response, if applicable.
-            logprobs must be set to true if this parameter is used.
-    """
-
-    messages: list[dict]
 
 
 @app.get("/v1/health")
@@ -160,19 +137,7 @@ def convert_numpy(obj):
         return obj
 
 
-def _helper_fun(
-    url,
-    model,
-    prompts,
-    temperature,
-    top_k,
-    top_p,
-    compute_logprob,
-    max_length,
-    apply_chat_template,
-    n_top_logprobs,
-    echo,
-):
+def _helper_fun(url, model, prompts, temperature, top_k, top_p, compute_logprob, max_length, apply_chat_template):
     """
     run_in_executor doesn't allow to pass kwargs, so we have this helper function to pass args as a list
     """
@@ -185,26 +150,13 @@ def _helper_fun(
         compute_logprob=compute_logprob,
         max_length=max_length,
         apply_chat_template=apply_chat_template,
-        n_top_logprobs=n_top_logprobs,
         init_timeout=300,
-        echo=echo,
     )
     return output
 
 
 async def query_llm_async(
-    *,
-    url,
-    model,
-    prompts,
-    temperature,
-    top_k,
-    top_p,
-    compute_logprob,
-    max_length,
-    apply_chat_template,
-    n_top_logprobs,
-    echo,
+    *, url, model, prompts, temperature, top_k, top_p, compute_logprob, max_length, apply_chat_template
 ):
     """
     Sends requests to `NemoQueryLLMPyTorch.query_llm` in a non-blocking way, allowing the server to process
@@ -227,8 +179,6 @@ async def query_llm_async(
             compute_logprob,
             max_length,
             apply_chat_template,
-            n_top_logprobs,
-            echo,
         )
     return result
 
@@ -251,27 +201,20 @@ async def completions_v1(request: CompletionRequest):
         temperature=request.temperature,
         top_k=request.top_k,
         top_p=request.top_p,
-        compute_logprob=(request.logprobs is not None and request.logprobs > 0),
+        compute_logprob=True if request.logprobs == 1 else False,
         max_length=request.max_tokens,
         apply_chat_template=False,
-        n_top_logprobs=request.logprobs,
-        echo=request.echo,
     )
 
     output_serializable = convert_numpy(output)
     output_serializable["choices"][0]["text"] = output_serializable["choices"][0]["text"][0][0]
-    if request.logprobs is not None and request.logprobs > 0:
+    if request.logprobs == 1:
         output_serializable["choices"][0]["logprobs"]["token_logprobs"] = output_serializable["choices"][0][
             "logprobs"
         ]["token_logprobs"][0]
         output_serializable["choices"][0]["logprobs"]["top_logprobs"] = output_serializable["choices"][0]["logprobs"][
             "top_logprobs"
         ][0]
-        if request.echo:
-            # output format requires empty logprobs for the 1st token
-            output_serializable["choices"][0]["logprobs"]["token_logprobs"].insert(0, None)
-    else:
-        output_serializable["choices"][0]["logprobs"] = None
     logging.info(f"Output: {output_serializable}")
     return output_serializable
 
@@ -284,7 +227,7 @@ def dict_to_str(messages):
 
 
 @app.post("/v1/chat/completions/")
-async def chat_completions_v1(request: ChatCompletionRequest):
+async def chat_completions_v1(request: CompletionRequest):
     """
     Defines the chat completions endpoint and queries the model deployed on PyTriton server.
     """
@@ -304,16 +247,13 @@ async def chat_completions_v1(request: ChatCompletionRequest):
         temperature=request.temperature,
         top_k=request.top_k,
         top_p=request.top_p,
-        compute_logprob=False,  # disable logprobs because we dont need them for any benchmark
+        compute_logprob=True if request.logprobs == 1 else False,
         max_length=request.max_tokens,
         apply_chat_template=True,
-        n_top_logprobs=None,
-        echo=False,  # chat request doesn't support echo
     )
     # Add 'role' as 'assistant' key to the output dict
     output["choices"][0]["message"] = {"role": "assistant", "content": output["choices"][0]["text"]}
     output["object"] = "chat.completion"
-    output["choices"][0]["logprobs"] = None
 
     del output["choices"][0]["text"]
 
@@ -321,6 +261,5 @@ async def chat_completions_v1(request: ChatCompletionRequest):
     output_serializable["choices"][0]["message"]["content"] = output_serializable["choices"][0]["message"]["content"][
         0
     ][0]
-
     logging.info(f"Output: {output_serializable}")
     return output_serializable

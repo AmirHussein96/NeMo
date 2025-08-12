@@ -15,7 +15,9 @@ import re
 
 import torch
 import torch.utils.data
-from lhotse import CutSet, Seconds, compute_num_frames
+import torchaudio
+
+from lhotse import CutSet, MonoCut, Recording, Seconds, SupervisionSegment, compute_num_frames
 from lhotse.cut import Cut
 from lhotse.dataset.collation import collate_audio, collate_vectors
 from lhotse.utils import ifnone
@@ -95,12 +97,13 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         self.target_sample_rate = target_sample_rate
         self.input_roles = set(ifnone(input_roles, ["user"]))
         self.output_roles = set(ifnone(output_roles, ["agent"]))
-
+        
         assert tokenizer.bos is not None, "BOS support in the tokenizer is required for S2S models."
         assert tokenizer.eos is not None, "EOS support in the tokenizer is required for S2S models."
 
     def __getitem__(self, cuts: CutSet) -> dict:
         cuts = cuts.transform_text(_strip_timestamps)
+
         source_audio, source_audio_lens = collate_audio(cuts.resample(self.source_sample_rate))
         target_audio, target_audio_lens = collate_audio(
             cuts.resample(self.target_sample_rate), recording_field="target_audio"
@@ -111,7 +114,13 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         source_tokens, source_token_lens = collate_token_channel(
             cuts, self.tokenizer, self.frame_length, roles=self.input_roles
         )
+        # extract target speaker first turn audio to uses for speaker conditioning
+        target_first_turn_audio, target_first_turn_audio_lens = collate_first_turn_audio(
+            cuts.resample(self.target_sample_rate), roles=self.output_roles, recording_field="target_audio"
+        )
+
         return {
+            "sample_id": [str(cut.id) for cut in cuts],
             "source_audio": source_audio,
             "source_audio_lens": source_audio_lens,
             "target_audio": target_audio,
@@ -123,7 +132,26 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             "target_texts": [
                 " ".join(s.text for s in cut.supervisions if s.speaker in self.output_roles) for cut in cuts
             ],
+            "target_first_turn_audio": target_first_turn_audio,
+            "target_first_turn_audio_lens": target_first_turn_audio_lens,
+            "formatter": [getattr(cut, "formatter", "s2s_duplex") for cut in cuts],
         }
+
+
+def collate_first_turn_audio(
+    cuts: CutSet,
+    roles: set[str],
+    recording_field: str = "target_audio",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    first_turn_audios = []
+    first_turn_audios_lens = []
+    for cut in cuts:
+        first_supervision = [s for s in cut.supervisions if s.speaker in roles][0]
+        truncated_audio = cut.truncate(offset=max(0, first_supervision.start), duration=first_supervision.duration).load_custom(recording_field)
+        first_turn_audios.append(truncated_audio.squeeze(0))
+        first_turn_audios_lens.append(truncated_audio.shape[-1])
+
+    return collate_vectors(first_turn_audios, padding_value=0), torch.tensor(first_turn_audios_lens)
 
 
 def collate_token_channel(
@@ -143,11 +171,11 @@ def collate_token_channel(
 
 
 def build_token_channel(
-    cut: Cut,
-    tokenizer: TokenizerSpec,
-    frame_length: Seconds,
-    roles: set[str],
-    pad_id: int = -1,
+        cut: Cut,
+        tokenizer: TokenizerSpec,
+        frame_length: Seconds,
+        roles: set[str],
+        pad_id: int = -1,
 ) -> torch.Tensor:
     diagnostic = f"Extra info: {cut.id=}"
     if getattr(cut, "shard_origin", None) is not None:
@@ -155,21 +183,32 @@ def build_token_channel(
 
     total = compute_num_frames(cut.duration, frame_length, cut.sampling_rate)
     tokens = torch.ones(total, dtype=torch.long) * pad_id
+
     for supervision in cut.supervisions:
         if supervision.speaker in roles:
             text_ids = torch.as_tensor([tokenizer.bos] + tokenizer.text_to_ids(supervision.text))
 
-            # Determine the frame offset for the start of the supervision to insert the text tokens.
             pos = compute_num_frames(supervision.start, frame_length, cut.sampling_rate)
-            if pos > len(tokens):
+            if pos >= len(tokens):  # Changed from > to >= for robustness
                 logging.warning(
-                    f"Ill-constructed example: the beginning offset of a supervision {pos} is larger than the example's length {len(tokens)}. {diagnostic}"
+                    f"Ill-constructed example: the beginning offset of a supervision {pos} is larger than or equal to the example's length {len(tokens)}. {diagnostic}"
                 )
                 continue
 
-            # Determine the frame offset for the last non-EOS text token to form a valid range for insertion;
-            # Note that EOS will be placed possibly much later, at the frame that coincides with end of speech,
-            # rather than end of text. The gap between last non-EOS token and EOS token will be filled with `pad_id`.
+
+            eospos = compute_num_frames(supervision.end, frame_length, cut.sampling_rate)
+
+
+            available_frames_for_text = eospos - pos
+
+
+            if available_frames_for_text > 0 and len(text_ids) > available_frames_for_text:
+                # Truncate text_ids to fit before the eos position.
+                text_ids = text_ids[:available_frames_for_text]
+            elif available_frames_for_text <= 0:
+                # If there's no space for text (e.g., start >= end), use an empty sequence.
+                text_ids = torch.tensor([], dtype=torch.long)
+
             endpos = pos + len(text_ids)
             if endpos > len(tokens):
                 trunc_len = len(tokens) - pos
@@ -177,18 +216,17 @@ def build_token_channel(
                     f"Truncating training example's text_ids of length {len(text_ids)} by {trunc_len} because {endpos=} > {len(tokens)=}. {diagnostic}"
                 )
                 text_ids = text_ids[:trunc_len]
+                endpos = pos + len(text_ids)  
+
             try:
                 tokens[pos:endpos] = text_ids
             except Exception as e:
                 raise RuntimeError(f"{tokens.shape=} {pos=} {endpos=} {text_ids.shape=} {diagnostic}") from e
 
-            # Insert EOS at the end of the supervision segment.
-            eospos = compute_num_frames(supervision.end, frame_length, cut.sampling_rate)
-            if eospos < len(tokens):  # skip otherwise - unfinished turn
+            if eospos < len(tokens):
                 tokens[eospos] = tokenizer.eos
 
     return tokens
-
 
 def _strip_timestamps(
     text: str, _TIMESTAMP_PATTERN=re.compile(r"<\|\d+\|>"), _SPACE_PATTERN=re.compile(r"\s+")

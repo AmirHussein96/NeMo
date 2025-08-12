@@ -379,13 +379,11 @@ def _iter_namespace(ns_pkg):
     return pkgutil.iter_modules(ns_pkg.__path__, ns_pkg.__name__ + ".")
 
 
-def list_available_evaluations() -> dict[str, list[str]]:
+def find_framework(eval_task: str) -> str:
     """
-    Finds all pre-defined evaluation configs across all installed evaluation frameworks.
+    Find framework for executing the evaluation eval_task.
 
-    Returns:
-        dict[str, list[str]]: Dictionary of available evaluations, where key is evaluation
-            framework and value is list of available tasks.
+    This function serches for framework (module) that defines a task with given name and returns the framework name.
     """
     # this import can be moved outside of this function when NeMoFWLMEval is
     # removed and we completed switch to NVIDIA Evals Factory
@@ -399,34 +397,12 @@ def list_available_evaluations() -> dict[str, list[str]]:
         name: importlib.import_module('.input', package=name) for finder, name, ispkg in _iter_namespace(core_evals)
     }
 
-    evals = {}
     for framework_name, input_module in discovered_modules.items():
-        # sanity check - it shouldn't be possible to find framework that is not a submodule of core_evals
-        if not framework_name.startswith("core_evals."):
-            raise RuntimeError(f"Framework {framework_name} is not a submodule of core_evals")
         _, task_name_mapping, *_ = input_module.get_available_evaluations()
-        evals[framework_name] = list(task_name_mapping.keys())
-    return evals
+        if eval_task in task_name_mapping.keys():
+            return framework_name
 
-
-def find_framework(eval_task: str) -> str:
-    """
-    Find framework for executing the evaluation eval_task.
-
-    This function serches for framework (module) that defines a task with given name and returns the framework name.
-    """
-    evals = list_available_evaluations()
-    frameworks = [f for f, tasks in evals.items() if eval_task in tasks]
-
-    if len(frameworks) == 0:
-        raise ValueError(f"Framework for task {eval_task} not found!")
-    elif len(frameworks) > 1:
-        frameworks_names = [f[len('core_evals.') :].replace('_', '-') for f in frameworks]
-        raise ValueError(
-            f"Multiple frameworks found for task {eval_task}: {frameworks_names}. "
-            "Please indicate which version should be used by passing <framework>.<task>"
-        )
-    return frameworks[0]
+    raise ValueError(f"Framework for task {eval_task} not found!")
 
 
 def _legacy_evaluate(

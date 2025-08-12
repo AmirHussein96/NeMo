@@ -27,9 +27,7 @@ from nemo.lightning.pytorch.optim import CosineAnnealingScheduler
 from nemo.lightning.run.plugins import MemoryProfilePlugin, NsysPlugin, PerfEnvPlugin
 
 from ..argument_parser import parse_cli_args
-from ..executors import slurm_executor
-from ..helpers import args_sanity_check
-from ..utils import import_ckpt_experiment
+from ..utils import args_sanity_check, import_ckpt_experiment, slurm_executor
 
 NUM_NODES = 1
 NUM_GPUS_PER_NODE = 8
@@ -306,7 +304,6 @@ if __name__ == "__main__":
     }
 
     executor = slurm_executor(
-        args.gpu.lower(),
         args.account,
         args.partition,
         args.log_dir,

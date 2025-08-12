@@ -63,7 +63,7 @@ def gemma3vl_data_step(dataloader_iter) -> Dict[str, torch.Tensor]:
         _batch = batch
 
     required_keys = set()
-    required_keys.update(("input_ids", "position_ids", "tokens"))
+    required_keys.update(("input_ids", "position_ids"))
     if ps.is_pipeline_first_stage():
         required_keys.update(("pixel_values",))
     if ps.is_pipeline_last_stage():
@@ -83,11 +83,9 @@ def gemma3vl_data_step(dataloader_iter) -> Dict[str, torch.Tensor]:
 
 def gemma3vl_forward_step(model, batch) -> torch.Tensor:
     """Gemma3 VL model forward step"""
-    if batch.get("input_ids") is None and batch.get("tokens") is None:
-        raise ValueError("Neither input_ids nor tokens is presented in the batch")
     forward_args = {
-        "input_ids": batch.get("input_ids", batch.get("tokens")),
-        "position_ids": batch.get("position_ids"),
+        "input_ids": batch["input_ids"],
+        "position_ids": batch["position_ids"],
         "pixel_values": batch.get("pixel_values", None),
         "loss_mask": batch.get("loss_mask", None),
         "labels": batch.get("labels", None),
@@ -136,7 +134,7 @@ class Gemma3VLConfig(TransformerConfig, io.IOMixin):
             for attr in MODEL_CONFIG_ATTR:
                 setattr(self, attr, getattr(self.language_transformer_config, attr))
 
-    def configure_model(self, tokenizer, vp_stage: Optional[int] = None) -> "MCoreGemma3VLModel":
+    def configure_model(self, tokenizer) -> "MCoreGemma3VLModel":
         """Configure Gemma3 VL model"""
         self.language_transformer_config.is_vision_language = True
         # Disable SP scatter to allow combining language and vision embedding.
@@ -158,10 +156,6 @@ class Gemma3VLConfig(TransformerConfig, io.IOMixin):
             if self.encoder_tensor_model_parallel_size > 0:
                 self.vision_transformer_config.tensor_model_parallel_size = self.encoder_tensor_model_parallel_size
                 self.vision_projection_config.tensor_model_parallel_size = self.encoder_tensor_model_parallel_size
-
-        assert (
-            getattr(self, "virtual_pipeline_model_parallel_size", None) is None and vp_stage is None
-        ), "Virtual pipeline model parallel size is not yet supported for Gemma3VL."
 
         model = MCoreGemma3VLModel(
             config=self,

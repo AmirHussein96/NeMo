@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# flake8: noqa
 # pylint: disable=C0115
 # pylint: disable=C0116
 # pylint: disable=C0301
@@ -21,7 +20,6 @@ import ast
 import math
 from functools import partial
 from itertools import islice
-from pathlib import Path
 from typing import Callable, Iterable
 
 import numpy as np
@@ -29,7 +27,6 @@ import pandas as pd
 from lhotse.cut import Cut
 from omegaconf import OmegaConf
 
-import nemo.collections.speechlm2.data.salm_dataset  # noqa
 from nemo.collections.asr.data.audio_to_text_lhotse import TokenizerWrapper
 from nemo.collections.common.data.lhotse.cutset import read_cutset_from_config
 from nemo.collections.common.data.lhotse.dataloader import LhotseDataLoadingConfig, tokenize, tokenize_with_prompt
@@ -40,7 +37,7 @@ from nemo.collections.common.data.lhotse.sampling import (
     TokenPerTokenFilter,
 )
 from nemo.collections.common.prompts.formatter import PromptFormatter
-from nemo.collections.common.tokenizers import AggregateTokenizer, AutoTokenizer, SentencePieceTokenizer
+from nemo.collections.common.tokenizers import AggregateTokenizer, SentencePieceTokenizer
 
 
 def parse_args():
@@ -230,22 +227,14 @@ def estimate_token_buckets(
 
     # Estimate an extra 2D bin set for global max duration.
     if num_subbuckets is not None:
-        if is_2d:
-            _estimate_output_token_buckets(max_bucket_duration=max_input_tokens)
-        else:
-            bins.append(max_input_tokens)
+        _estimate_output_token_buckets(max_bucket_duration=max_input_tokens)
 
     return bins
 
 
 def load_tokenizer(paths: list[str], langs: list[str] = None) -> TokenizerWrapper:
     if len(paths) == 1:
-        (p,) = paths
-        if Path(p).exists():
-            tok = SentencePieceTokenizer(p)
-        else:
-            # Assume it's HF name
-            tok = AutoTokenizer(p, use_fast=True)
+        tok = SentencePieceTokenizer(paths[0])
     else:
         assert langs is not None and len(paths) == len(
             langs
@@ -300,7 +289,7 @@ def main():
     assert args.input.endswith(".yaml")
     config = OmegaConf.merge(
         OmegaConf.structured(LhotseDataLoadingConfig),
-        OmegaConf.from_dotlist([f"input_cfg={args.input}", "force_finite=True", "metadata_only=True"]),
+        OmegaConf.from_dotlist([f"input_cfg={args.input}"]),
     )
     cuts, _ = read_cutset_from_config(config)
     cuts = cuts.map(partial(apply_tokenizer, tokenizer=tokenizer, prompt=prompt), apply_fn=None)

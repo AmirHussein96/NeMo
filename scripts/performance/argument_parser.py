@@ -86,14 +86,13 @@ def parse_cli_args():
         default="bf16",
     )
     fp8_recipe_msg = (
-        "FP8 recipe. Options- ds (per-tensor delayed scaling), cs (per-tensor current scaling), "
-        "mxfp8, ss (subchannel scaling). Defaults to ds"
+        "FP8 recipe. Options- ds (per-tensor delayed scaling), cs (per-tensor current scaling), mxfp8. Defaults to ds"
     )
     parser.add_argument(
         "-fr",
         "--fp8_recipe",
         type=str,
-        choices=["ds", "cs", "mxfp8", "ss"],
+        choices=["ds", "cs", "mxfp8"],
         help=fp8_recipe_msg,
         required=False,
         default="ds",
@@ -302,14 +301,6 @@ def parse_cli_args():
         default=None,
     )
     parser.add_argument(
-        "-fsdp_db",
-        "--use_fsdp_double_buffer",
-        help="Enable FSDP double buffer. Disabled by default",
-        type=bool_arg,
-        required=False,
-        default=None,
-    )
-    parser.add_argument(
         "-ubr",
         "--use_user_buffer_registration",
         help="Enable user buffer registration. Disabled by default",
@@ -359,8 +350,7 @@ def parse_cli_args():
         nargs="*",
         const=None,
         type=str,
-        help="List of modules to perform selective activation recompute. "
-        "Users can provide 0 or any number of arguments. Defaults to None",
+        help="List of modules to perform selective activation recompute. Users can provide 0 or any number of arguments. Defaults to None",
         required=False,
         default=None,
     )
@@ -377,21 +367,6 @@ def parse_cli_args():
         help="Use HuggingFace tokenizer. Disabled by default. Null tokenizer will be used if not provided.",
         action="store_true",
         required=False,
-    )
-    parser.add_argument(
-        "-dcdfr",
-        "--dump_config_diff_from_base_recipe",
-        help="Dump the config diff from the base recipe. Defaults to False",
-        action="store_true",
-        required=False,
-        default=False,
-    )
-    parser.add_argument(
-        "--keep_fsdp_fp8_transpose_cache",
-        help="Keep FSDP FP8 transpose cache. Disabled by default",
-        type=bool_arg,
-        required=False,
-        default=None,
     )
 
     return parser

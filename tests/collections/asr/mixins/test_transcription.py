@@ -44,41 +44,6 @@ class DummyModel(torch.nn.Module):
         return out
 
 
-class DummyDatasetAudioOnly(Dataset):
-    def __init__(self, audio_files: List[str], config: Dict):
-        self.audio_files = audio_files
-        self.config = config
-
-    def __getitem__(self, index):
-        data = self.audio_files[index]
-        data = torch.tensor([float(data)]).view(1)
-        return data
-
-    def __len__(self):
-        return len(self.audio_files)
-
-
-class DummyDataset(Dataset):
-    def __init__(self, audio_tensors: List[str], config: Dict = None):
-        self.audio_tensors = audio_tensors
-        self.config = config
-
-    def __getitem__(self, index):
-        data = self.audio_tensors[index]
-        samples = torch.tensor(data)
-        # Calculate seq length
-        seq_len = torch.tensor(samples.shape[0], dtype=torch.long)
-
-        # Dummy text tokens
-        text_tokens = torch.tensor([0], dtype=torch.long)
-        text_tokens_len = torch.tensor(1, dtype=torch.long)
-
-        return (samples, seq_len, text_tokens, text_tokens_len)
-
-    def __len__(self):
-        return len(self.audio_tensors)
-
-
 @pytest.mark.with_downloads()
 @pytest.fixture()
 def audio_files(test_data_dir):
@@ -120,7 +85,20 @@ class TranscribableDummy(DummyModel, TranscriptionMixin):
         return ds_config
 
     def _setup_transcribe_dataloader(self, config: Dict) -> DataLoader:
-        dataset = DummyDatasetAudioOnly(config['paths2audio_files'], config)
+        class DummyDataset(Dataset):
+            def __init__(self, audio_files: List[str], config: Dict):
+                self.audio_files = audio_files
+                self.config = config
+
+            def __getitem__(self, index):
+                data = self.audio_files[index]
+                data = torch.tensor([float(data)]).view(1)
+                return data
+
+            def __len__(self):
+                return len(self.audio_files)
+
+        dataset = DummyDataset(config['paths2audio_files'], config)
 
         return DataLoader(
             dataset=dataset,
@@ -159,6 +137,27 @@ class TranscribableDummy(DummyModel, TranscriptionMixin):
     def _transcribe_on_end(self, trcfg: TranscribeConfig):
         super()._transcribe_on_end(trcfg)
         self.flag_end = True
+
+
+class DummyDataset(Dataset):
+    def __init__(self, audio_tensors: List[str], config: Dict = None):
+        self.audio_tensors = audio_tensors
+        self.config = config
+
+    def __getitem__(self, index):
+        data = self.audio_tensors[index]
+        samples = torch.tensor(data)
+        # Calculate seq length
+        seq_len = torch.tensor(samples.shape[0], dtype=torch.long)
+
+        # Dummy text tokens
+        text_tokens = torch.tensor([0], dtype=torch.long)
+        text_tokens_len = torch.tensor(1, dtype=torch.long)
+
+        return (samples, seq_len, text_tokens, text_tokens_len)
+
+    def __len__(self):
+        return len(self.audio_tensors)
 
 
 @pytest.fixture()
@@ -471,8 +470,8 @@ class TestTranscriptionMixin:
         # check hypothesis object
         assert isinstance(output[0], Hypothesis)
         # check transcript
-        assert output[0].text in ['Stop', 'Stop?']
-        assert output[1].text in ['Start', 'Start.']
+        assert output[0].text == 'Stop'
+        assert output[1].text == 'Start.'
 
         # check timestamp
         assert output[0].timestamp['segment'][0]['start'] == pytest.approx(0.4)

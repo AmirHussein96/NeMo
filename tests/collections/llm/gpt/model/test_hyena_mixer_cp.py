@@ -167,17 +167,11 @@ def zigzag_gather_from_group_ranks(data, group, seq_dim=0):
 
 
 class B2BConv1d(torch.nn.Module):
-    def __init__(self, seq_len, use_b2b_causal_conv1d=False):
+    def __init__(self, hyena_config, hyena_test_config, seq_len, use_b2b_causal_conv1d=False):
         super().__init__()
-
-        self.use_b2b_causal_conv1d = use_b2b_causal_conv1d
 
         # Create necessary submodules - use the mixer submodules like in the regular mixer fixture
         submodules = hyena_stack_spec_no_te.submodules.hyena_layer.submodules.mixer.submodules
-
-        # Set the b2b parameter in the config
-        hyena_config = HyenaConfig(num_groups_hyena=4096, num_groups_hyena_short=256, num_groups_hyena_medium=256)
-        hyena_test_config = HyenaTestConfig(params_dtype=torch.float32, use_b2b_causal_conv1d=use_b2b_causal_conv1d)
 
         logging.info("Creating HyenaMixer...")
         self.mixer = HyenaMixer(
@@ -190,16 +184,11 @@ class B2BConv1d(torch.nn.Module):
         )
 
     def forward(self, x, _use_cp=True):
-        if self.use_b2b_causal_conv1d:
-            logging.info(f"Using b2b_causal_conv1d: {self.use_b2b_causal_conv1d}")
-            z = self.mixer.b2b_kernel(x, _use_cp=_use_cp)
-        else:
-            logging.info("Using PyTorch implementation")
-            features = self.mixer.hyena_proj_conv(x, _use_cp=_use_cp)
-            x1, x2, v = rearrange(
-                features, "b (g dg p) l -> b (g dg) p l", p=3, g=self.mixer.num_groups_per_tp_rank
-            ).unbind(dim=2)
-            z = self.mixer.mixer(x1, x2, v, _hyena_use_cp=_use_cp)
+        features = self.mixer.hyena_proj_conv(x, _use_cp=_use_cp)
+        x1, x2, v = rearrange(
+            features, "b (g dg p) l -> b (g dg) p l", p=3, g=self.mixer.num_groups_per_tp_rank
+        ).unbind(dim=2)
+        z = self.mixer.mixer(x1, x2, v, _hyena_use_cp=_use_cp)
         return z
 
 
@@ -259,10 +248,21 @@ if __name__ == "__main__":
         # Initialize the model parallel RNG
         model_parallel_cuda_manual_seed(42)
 
-        # Model initialization
+        # Your model initialization and other code here
+        hyena_config = HyenaConfig(num_groups_hyena=4096, num_groups_hyena_short=256, num_groups_hyena_medium=256)
+        hyena_test_config = HyenaTestConfig(params_dtype=torch.float32)
+
         batch_size = 2
         seq_len = 512
-        b2b_conv1d = B2BConv1d(seq_len=seq_len, use_b2b_causal_conv1d=args.use_b2b_causal_conv1d)
+        b2b_conv1d = B2BConv1d(
+            hyena_config,
+            hyena_test_config,
+            seq_len=512,
+            use_b2b_causal_conv1d=args.use_b2b_causal_conv1d,
+        )
+
+        # Log configuration
+        logging.info(f"Using b2b_causal_conv1d: {args.use_b2b_causal_conv1d}")
 
         ddp_b2b_conv1d = DDP(
             b2b_conv1d,

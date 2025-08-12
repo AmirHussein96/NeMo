@@ -24,7 +24,6 @@ from torch.utils.data import DataLoader, Dataset
 from transformers import Gemma3ImageProcessor
 
 from nemo.lightning.pytorch.plugins import MegatronDataSampler
-from nemo.utils import logging
 
 IMAGE_TOKEN_INDEX = 262144
 IMAGE_SIZE = 896
@@ -38,7 +37,7 @@ class Gemma3VLMockDataModule(pl.LightningDataModule):
 
     def __init__(
         self,
-        tokenizer: Optional = None,
+        tokenizer,
         seq_length: int = 2048,
         micro_batch_size: int = 4,
         global_batch_size: int = 8,
@@ -61,12 +60,6 @@ class Gemma3VLMockDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
         self.pin_memory = pin_memory
         self.persistent_workers = persistent_workers
-
-        if tokenizer is None:
-            logging.warning("Tokenizer is not provided! Fall back to `'google/gemma-3-4b-it'`.")
-            from nemo.collections.common.tokenizers.huggingface.auto_tokenizer import AutoTokenizer
-
-            self.tokenizer = tokenizer or AutoTokenizer("google/gemma-3-4b-it")
 
         self.image_processor = Gemma3ImageProcessor(
             size={"height": IMAGE_SIZE, "width": IMAGE_SIZE},

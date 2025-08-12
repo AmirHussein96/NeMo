@@ -24,13 +24,12 @@ from torch import Tensor
 from torch.nn.modules.loss import _Loss
 
 from nemo.utils import logging
-from nemo.utils.import_utils import safe_import, safe_import_from
-
-mtd, _ = safe_import("modelopt.torch.distill")
-DistillationLossBalancer, _ = safe_import_from("modelopt.torch.distill", "DistillationLossBalancer", alt=object)
+from nemo.utils.import_utils import safe_import
 
 if TYPE_CHECKING:
     from megatron.core.transformer.transformer_config import TransformerConfig
+
+mtd, _ = safe_import("modelopt.torch.distill")
 
 
 class BaseLoss(_Loss, metaclass=ABCMeta):
@@ -237,7 +236,7 @@ class LogitsKLLoss(BaseLoss):
         return self.post_forward(loss, tp_reduce=True)
 
 
-class LogitsAndIntermediatesLossBalancer(DistillationLossBalancer):
+class LogitsAndIntermediatesLossBalancer(mtd.DistillationLossBalancer):
     """
     LossBalancer implementation for Logit and Intermediate losses.
 

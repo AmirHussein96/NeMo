@@ -50,17 +50,6 @@ class AudioPerceptionModule(NeuralModule, Exportable):
             "encoded_len": NeuralType(tuple("B"), LengthsType()),
         }
 
-    @property
-    def token_equivalent_duration(self) -> float:
-        """
-        Returns the audio duration corresponding to a single frame/token in the output
-        of this module.
-        """
-        frame_shift = self.preprocessor.featurizer.hop_length / self.preprocessor.featurizer.sample_rate
-        encoder_subsampling = self.encoder.subsampling_factor
-        adapter_subsampling = getattr(self.modality_adapter, "subsampling_factor", 1.0)
-        return frame_shift * encoder_subsampling * adapter_subsampling
-
     def __init__(self, cfg: DictConfig):
         super().__init__()
         # Initialize components
@@ -77,6 +66,14 @@ class AudioPerceptionModule(NeuralModule, Exportable):
             self.proj = nn.Linear(cfg.modality_adapter.d_model, cfg.output_dim)
         else:
             self.proj = nn.Identity()
+        
+        self.modality_adapter_quantizer_levels = cfg.get("modality_adapter_quantizer_levels", None)
+        if self.modality_adapter_quantizer_levels:
+            from nemo.collections.tts.modules.audio_codec_modules import FiniteScalarQuantizer
+            bottleneck_dim = len(self.modality_adapter_quantizer_levels)
+            self.modality_adapter_quantizer_bottleneck = nn.Linear(cfg.modality_adapter.d_model, bottleneck_dim)
+            self.modality_adapter_vector_quantizer = FiniteScalarQuantizer(self.modality_adapter_quantizer_levels)
+            self.modality_adapter_quantizer_projection = nn.Linear(bottleneck_dim, cfg.modality_adapter.d_model)
 
     def maybe_preprocess_audio(
         self,
@@ -108,6 +105,7 @@ class AudioPerceptionModule(NeuralModule, Exportable):
         input_signal_length=None,
         processed_signal=None,
         processed_signal_length=None,
+        return_encoder_emb=False,
     ):
         processed_signal, processed_signal_length = self.maybe_preprocess_audio(
             input_signal, input_signal_length, processed_signal, processed_signal_length
@@ -117,14 +115,23 @@ class AudioPerceptionModule(NeuralModule, Exportable):
         if self.spec_augmentation is not None and self.training:
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
 
-        encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
+        encoder_emb, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
+
+        if self.modality_adapter_quantizer_levels is not None:
+            encoded = self.modality_adapter_quantizer_bottleneck(encoder_emb.transpose(1, 2))
+            encoded, _ = self.modality_adapter_vector_quantizer(inputs=encoded.transpose(1, 2), input_len=None)
+            encoded = self.modality_adapter_quantizer_projection(encoded.transpose(1, 2)).transpose(1, 2)
+        else:
+            encoded = encoder_emb
+
         encoded, encoded_len = self.modality_adapter(audio_signal=encoded, length=encoded_len)
 
         # b, c, t -> b, t, c
         encoded = self.proj(encoded.transpose(1, 2))
-
-        return encoded, encoded_len
-
+        if return_encoder_emb:
+            return encoded, encoded_len, encoder_emb.transpose(1, 2)
+        else:
+            return encoded, encoded_len
 
 class IdentityConnector(NeuralModule, Exportable):
     """User to pass encoder's representations as-is to the LLM."""

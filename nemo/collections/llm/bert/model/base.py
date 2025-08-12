@@ -66,9 +66,9 @@ def bert_data_step(dataloder_iter) -> Dict[str, torch.Tensor]:
 
     required_keys = set()
     required_keys.add("padding_mask")
-    if parallel_state.is_pipeline_first_stage():
+    if parallel_state.is_pipeline_first_stage(ignore_virtual=False):
         required_keys.add("text")
-    if parallel_state.is_pipeline_last_stage():
+    if parallel_state.is_pipeline_last_stage(ignore_virtual=False):
         required_keys.update(("labels", "loss_mask", "types", "is_random"))
 
     _batch = {key: val.cuda(non_blocking=True) if key in required_keys else None for key, val in _batch.items()}
@@ -150,7 +150,7 @@ class BertConfig(TransformerConfig, io.IOMixin):
     num_tokentypes: float = None
     mask_vocab_padding_tokens: bool = False
 
-    def configure_model(self, tokenizer, vp_stage: Optional[int] = None) -> "MCoreBertModelWrapperWithPostLNSupport":
+    def configure_model(self, tokenizer) -> "MCoreBertModelWrapperWithPostLNSupport":
         """Configure the BERT Model.
         For bert_type == 'megatron', num_tokentypes in embedding is controlled by whether model has binary head.
         For bert_type == 'huggingface', tokentypes embedding is always added with num_tokentypes = 2.
@@ -170,9 +170,6 @@ class BertConfig(TransformerConfig, io.IOMixin):
         if self.num_tokentypes is None:
             self.num_tokentypes = 2 if self.bert_binary_head else 0
 
-        # During fake lightning initialization, pass 0 to bypass the assertion that vp_stage must be
-        # non-None when using virtual pipeline model parallelism
-        vp_stage = vp_stage or 0
         return MCoreBertModelWrapperWithPostLNSupport(
             bert_type=self.bert_type,
             add_pooler=self.add_pooler,
@@ -182,8 +179,8 @@ class BertConfig(TransformerConfig, io.IOMixin):
             vocab_size=get_vocab_size(self, tokenizer.vocab_size, self.make_vocab_size_divisible_by),
             tokenizer=tokenizer if self.mask_vocab_padding_tokens else None,
             max_sequence_length=self.seq_length,
-            pre_process=parallel_state.is_pipeline_first_stage(ignore_virtual=False, vp_stage=vp_stage),
-            post_process=parallel_state.is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage),
+            pre_process=parallel_state.is_pipeline_first_stage(ignore_virtual=False),
+            post_process=parallel_state.is_pipeline_last_stage(ignore_virtual=False),
             fp16_lm_cross_entropy=self.fp16_lm_cross_entropy,
             parallel_output=self.parallel_output,
             share_embeddings_and_output_weights=self.share_embeddings_and_output_weights,
@@ -193,7 +190,6 @@ class BertConfig(TransformerConfig, io.IOMixin):
             seq_len_interpolation_factor=self.seq_len_interpolation_factor,
             add_binary_head=self.bert_binary_head,
             return_embeddings=False,  # TODO
-            vp_stage=vp_stage,
         )
 
 
@@ -207,6 +203,7 @@ class MCoreBertModelWrapperWithPostLNSupport(MCoreBert):
     def __init__(
         self, bert_type='megatron', add_pooler=True, tokenizer: Optional["TokenizerSpec"] = None, *args, **kwargs
     ):
+
         super(MCoreBertModelWrapperWithPostLNSupport, self).__init__(*args, **kwargs)
         self.add_pooler = add_pooler
         self.bert_type = bert_type
@@ -224,20 +221,14 @@ class MCoreBertModelWrapperWithPostLNSupport(MCoreBert):
             post_process=self.post_process,
             post_layer_norm=True if self.bert_type == 'megatron' else False,
             bert_type=self.bert_type,
-            vp_stage=kwargs.get('vp_stage', None),
         )
-
-        # Megatron Core always initializes position embeddings and tokentype_embeddings in fp32
-        # We cast the embedding dtype based on the target dtype in config
-        if self.pre_process:
-            self.embedding.to(self.config.params_dtype)
 
         # In Megatron-LM, pooler is added only if add_binary_head=True.
         # We make it independent to support HF variances.
         if self.add_pooler:
             self.pooler = Pooler(
                 self.config.hidden_size, self.config.init_method, self.config, self.config.sequence_parallel
-            ).to(self.config.params_dtype)
+            )
 
         # Output
         if self.post_process:
@@ -367,10 +358,7 @@ class TransformerLayerSubmodulesWithPostLNSupport(TransformerLayerSubmodules):
 
 
 class TransformerLayerWithPostLNSupport(TransformerLayer):
-    """
-    Adapted from mcore's TransformerLayer with additional post-attention LN and
-    post MLP LN support.
-    """
+    """Adapted from mcore's TransformerLayer with additional post-attention LN and post MLP LN support."""
 
     def __init__(self, *args, **kwargs):
         super(TransformerLayerWithPostLNSupport, self).__init__(*args, **kwargs)
@@ -517,7 +505,7 @@ class TransformerBlockWithPostLNSupport(TransformerBlock):
             # megatron's embedding module does not need the additional LN.
             self.initial_layernorm = FusedLayerNorm(
                 config=self.config, hidden_size=self.config.hidden_size, eps=self.config.layernorm_epsilon
-            ).to(self.config.params_dtype)
+            )
 
     def forward(
         self,
@@ -595,10 +583,10 @@ class BertModel(L.LightningModule, io.IOMixin, io.ConnectorMixin, fn.FNMixin):
         self._training_loss_reduction = None
         self._validation_loss_reduction = None
 
-    def configure_model(self, vp_stage: Optional[int] = None) -> None:
+    def configure_model(self) -> None:
         """Setup the BERT Model based on config definition."""
         if not hasattr(self, "module"):
-            self.module = self.config.configure_model(self.tokenizer, vp_stage)
+            self.module = self.config.configure_model(self.tokenizer)
 
     def forward(
         self,
