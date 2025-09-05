@@ -20,6 +20,7 @@ import torchaudio
 from lhotse import CutSet, MonoCut, Recording, Seconds, SupervisionSegment, compute_num_frames
 from lhotse.cut import Cut
 from lhotse.dataset.collation import collate_audio, collate_vectors
+from lhotse.utils import fastcopy
 from lhotse.utils import ifnone
 
 from nemo.collections.common.tokenizers import TokenizerSpec
@@ -27,7 +28,7 @@ from nemo.collections.speechlm2.data.utils import get_pad_id
 from nemo.utils import logging
 
 
-class DuplexS2SDataset(torch.utils.data.Dataset):
+class DuplexS2SDatasetST(torch.utils.data.Dataset):
     """
     A dataset for duplex speech-to-speech models that handles bidirectional conversations.
 
@@ -102,25 +103,24 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
         assert tokenizer.eos is not None, "EOS support in the tokenizer is required for S2S models."
 
     def __getitem__(self, cuts: CutSet) -> dict:
-        cuts = cuts.transform_text(_strip_timestamps)
-        source_audio, source_audio_lens = collate_audio(cuts.resample(self.source_sample_rate))
-        target_audio, target_audio_lens = collate_audio(
-            cuts.resample(self.target_sample_rate), recording_field="target_audio"
-        )
-        target_tokens, target_token_lens = collate_token_channel(
-            cuts, self.tokenizer, self.frame_length, roles=self.output_roles
-        )
-        source_tokens, source_token_lens = collate_token_channel(
-            cuts, self.tokenizer, self.frame_length, roles=self.input_roles
-        )
-        # extract target speaker first turn audio to uses for speaker conditioning
-        target_first_turn_audio, target_first_turn_audio_lens = collate_first_turn_audio(
-            cuts.resample(self.target_sample_rate), roles=self.output_roles, recording_field="target_audio"
-        )
-        # target_first_turn_audio, target_first_turn_audio_lens = collate_first_turn_audio_source(
-        #     cuts.resample(self.target_sample_rate), roles=self.input_roles,
-        # )
 
+        cuts = cuts.map(set_target_duration)
+        source_audio, source_audio_lens = collate_audio(cuts.resample(self.source_sample_rate))
+        
+        target_audio, target_audio_lens = collate_audio(
+            cuts.resample(self.target_sample_rate), recording_field="target_recording"
+        )
+
+        target_tokens, target_token_lens = collate_token_channel(
+            cuts, self.tokenizer, self.frame_length, roles=self.output_roles, target_sample_rate=self.target_sample_rate, source_sample_rate=self.source_sample_rate
+        )
+        # source_tokens, source_token_lens = collate_token_channel(
+        #     cuts, self.tokenizer, self.frame_length, roles=self.input_roles
+        # )
+        # extract target speaker first turn audio to uses for speaker conditioning
+        # target_first_turn_audio, target_first_turn_audio_lens = collate_first_turn_audio(
+        #     cuts.resample(self.target_sample_rate), roles=self.output_roles, recording_field="target_audio"
+        # )
 
         return {
             "sample_id": [str(cut.id) for cut in cuts],
@@ -130,21 +130,29 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             "target_audio_lens": target_audio_lens,
             "target_tokens": target_tokens,
             "target_token_lens": target_token_lens,
-            "source_tokens": source_tokens,
-            "source_token_lens": source_token_lens,
+            # "source_tokens": source_tokens,
+            # "source_token_lens": source_token_lens,
             "target_texts": [
-                " ".join(s.text for s in cut.supervisions if s.speaker in self.output_roles) for cut in cuts
+                " ".join(cut.custom['tgt_traj']) for cut in cuts
             ],
-            "first_turn_audio": target_first_turn_audio,
-            "first_turn_audio_lens": target_first_turn_audio_lens,
+            #     "target_first_turn_audio": target_first_turn_audio,
+            #     "target_first_turn_audio_lens": target_first_turn_audio_lens,
             "formatter": [getattr(cut, "formatter", "s2s_duplex") for cut in cuts],
         }
 
+def set_target_duration(cut):
+    if cut.custom['target_recording'].duration != cut.custom['tgt_duration']:
+        cut.custom['target_recording'].duration = cut.custom['tgt_duration']
+    return fastcopy(cut, custom={**cut.custom})
+
+def set_cuts_duration(cut):
+    cut.duration = cut.custom['tgt_duration']
+    return fastcopy(cut, custom={**cut.custom})
 
 def collate_first_turn_audio(
     cuts: CutSet,
     roles: set[str],
-    recording_field: str = "target_audio",
+    recording_field: str = "target_recording",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     first_turn_audios = []
     first_turn_audios_lens = []
@@ -157,30 +165,17 @@ def collate_first_turn_audio(
     return collate_vectors(first_turn_audios, padding_value=0), torch.tensor(first_turn_audios_lens)
 
 
-def collate_first_turn_audio_source(
-    cuts: CutSet,
-    roles: set[str],
-) -> tuple[torch.Tensor, torch.Tensor]:
-    first_turn_audios = []
-    first_turn_audios_lens = []
-    for cut in cuts:
-        first_supervision = [s for s in cut.supervisions if s.speaker in roles][0]
-        truncated_audio = cut.truncate(offset=max(0, first_supervision.start), duration=first_supervision.duration).load_audio()
-        first_turn_audios.append(truncated_audio.squeeze(0))
-        first_turn_audios_lens.append(truncated_audio.shape[-1])
-
-    return collate_vectors(first_turn_audios, padding_value=0), torch.tensor(first_turn_audios_lens)
-
-
 def collate_token_channel(
     cuts: CutSet,
     tokenizer: TokenizerSpec,
     frame_length: Seconds,
     roles: set[str],
+    target_sample_rate: int = 22050,
+    source_sample_rate: int = 16000,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     pad_id = get_pad_id(tokenizer)
     tokens = [
-        build_token_channel(c, tokenizer=tokenizer, frame_length=frame_length, roles=roles, pad_id=pad_id)
+        build_token_channel(c, tokenizer=tokenizer, frame_length=frame_length, pad_id=pad_id, roles=roles, target_sample_rate=target_sample_rate, source_sample_rate=source_sample_rate)
         for c in cuts
     ]
     token_lens = torch.tensor([len(tt) for tt in tokens])
@@ -194,55 +189,104 @@ def build_token_channel(
         frame_length: Seconds,
         roles: set[str],
         pad_id: int = -1,
+        target_sample_rate: int = 22050,
+        source_sample_rate: int = 16000,
 ) -> torch.Tensor:
     diagnostic = f"Extra info: {cut.id=}"
     if getattr(cut, "shard_origin", None) is not None:
         diagnostic = f"{diagnostic} {cut.shard_origin=}"
-    total = compute_num_frames(cut.duration, frame_length, cut.sampling_rate)
+    # src_chunk_size = compute_num_frames(cut.custom['chunk_size_ms'], frame_length, cut.sampling_rate)
+    # tgt_chunk_size = compute_num_frames(cut.custom['chunk_size_ms'], frame_length, self.target_sample_rate)
+    src = compute_num_frames(cut.duration, frame_length, source_sample_rate)
+    tgt = compute_num_frames(cut.custom['tgt_duration'], frame_length, target_sample_rate)
+    
+    
+    src_alignments = cut.custom['src_merged_alignments']
+    tgt_alignments = cut.custom['tgt_merged_alignments']
+    total = src + tgt + len(src_alignments) + 1# to ensure sufficient buffer space 
     tokens = torch.ones(total, dtype=torch.long) * pad_id
-
-    for supervision in cut.supervisions:
-        if supervision.speaker in roles:
-            text_ids = torch.as_tensor([tokenizer.bos] + tokenizer.text_to_ids(supervision.text))
-
-            pos = compute_num_frames(supervision.start, frame_length, cut.sampling_rate)
-            if pos >= len(tokens):  # Changed from > to >= for robustness
-                logging.warning(
-                    f"Ill-constructed example: the beginning offset of a supervision {pos} is larger than or equal to the example's length {len(tokens)}. {diagnostic}"
-                )
-                continue
+    assert len(src_alignments) == len(tgt_alignments), f"src_alignments and tgt_alignments have different lengths: {len(src_alignments)} != {len(tgt_alignments)}"
+    offset = compute_num_frames(cut.supervisions[0].start, frame_length, source_sample_rate) # offset points to the latest next frame in the total buffer 
+    prev_src_end_frame = offset - 1
+    prev_tgt_end_frame = -1
+    
+    for i, (src_alignment, tgt_alignment) in enumerate(zip(src_alignments, tgt_alignments)):
 
 
-            eospos = compute_num_frames(supervision.end, frame_length, cut.sampling_rate)
+        if src_alignment and tgt_alignment:
+            # if both available update offset and add tgt text after src
+            
+            text_ids = torch.as_tensor([tokenizer.bos] + tokenizer.text_to_ids(tgt_alignment[0]))
+            tgt_alig_frames = [tgt_alignment[1], tgt_alignment[1]+tgt_alignment[2]]
+            src_alig_frames = [src_alignment[1], src_alignment[1]+src_alignment[2]]
+            tgt_alig_frames = compute_num_frames(tgt_alig_frames[0], frame_length, target_sample_rate), compute_num_frames(tgt_alig_frames[1], frame_length, target_sample_rate)
+            src_alig_frames = compute_num_frames(src_alig_frames[0], frame_length, source_sample_rate), compute_num_frames(src_alig_frames[1], frame_length, source_sample_rate)
+
+            tgt_start_pos = offset + (src_alig_frames[1] - prev_src_end_frame)  # start from the next frame
+            tgt_end_pos = tgt_start_pos + (tgt_alig_frames[1] - prev_tgt_end_frame) - 1 
+        #tgt_txt_start_pos = tgt_start_pos + tgt_alig_frames[0] # start of the target text (explore this later)
+        # this depends if we later want the target audio conditionally dependent on the text
+            tgt_txt_start_pos = tgt_start_pos
+            offset = tgt_end_pos + 1
+            prev_src_end_frame = src_alig_frames[1]  
+            prev_tgt_end_frame = tgt_alig_frames[1]
+        elif src_alignment:
+            # if only src available, update offset 
+            src_alig_frames = [src_alignment[1], src_alignment[1]+src_alignment[2]]
+            src_alig_frames = compute_num_frames(src_alig_frames[0], frame_length, source_sample_rate), compute_num_frames(src_alig_frames[1], frame_length, source_sample_rate)
+            offset = offset + (src_alig_frames[1] - prev_src_end_frame) + 1
+            prev_src_end_frame = src_alig_frames[1]
+            continue
+        
+        elif tgt_alignment:
+            text_ids = torch.as_tensor([tokenizer.bos] + tokenizer.text_to_ids(tgt_alignment[0]))
+            tgt_alig_frames = [tgt_alignment[1], tgt_alignment[1]+tgt_alignment[2]]
+            tgt_alig_frames = compute_num_frames(tgt_alig_frames[0], frame_length, target_sample_rate), compute_num_frames(tgt_alig_frames[1], frame_length, target_sample_rate)
+            tgt_start_pos = offset
+            tgt_end_pos = tgt_start_pos + (tgt_alig_frames[1] - prev_tgt_end_frame) - 1 
+
+            tgt_txt_start_pos = tgt_start_pos
+            prev_tgt_end_frame = tgt_alig_frames[1]
+            offset = tgt_end_pos + 1
+        else:
+            continue
+            
+
+        if tgt_txt_start_pos >= len(tokens):  # Changed from > to >= for robustness
+            logging.warning(
+                f"Ill-constructed example: the beginning offset of a supervision {tgt_txt_start_pos} is larger than or equal to the example's length {len(tokens)}. {diagnostic}"
+            )
+            continue
+
+        available_frames_for_text = tgt_end_pos - tgt_txt_start_pos + 1
 
 
-            available_frames_for_text = eospos - pos
+        if available_frames_for_text > 0 and len(text_ids) > available_frames_for_text:
+            # Truncate text_ids to fit before the eos position.
+            text_ids = text_ids[:available_frames_for_text]
+        elif available_frames_for_text <= 0:
+            # If there's no space for text (e.g., start >= end), use an empty sequence.
+            text_ids = torch.tensor([], dtype=torch.long)
 
+        endpos = tgt_txt_start_pos + len(text_ids)
+        if endpos > len(tokens):
+            trunc_len = len(tokens) - tgt_txt_start_pos
+            logging.warning(
+                f"Truncating training example's text_ids of length {len(text_ids)} by {trunc_len} because {endpos=} > {len(tokens)=}. {diagnostic}"
+            )
+            text_ids = text_ids[:trunc_len]
+            endpos = tgt_txt_start_pos + len(text_ids)  
 
-            if available_frames_for_text > 0 and len(text_ids) > available_frames_for_text:
-                # Truncate text_ids to fit before the eos position.
-                text_ids = text_ids[:available_frames_for_text]
-            elif available_frames_for_text <= 0:
-                # If there's no space for text (e.g., start >= end), use an empty sequence.
-                text_ids = torch.tensor([], dtype=torch.long)
+        try:
+            tokens[tgt_txt_start_pos:endpos] = text_ids
+        except Exception as e:
+            raise RuntimeError(f"{tokens.shape=} {tgt_txt_start_pos=} {endpos=} {text_ids.shape=} {diagnostic}") from e
 
-            endpos = pos + len(text_ids)
-            if endpos > len(tokens):
-                trunc_len = len(tokens) - pos
-                logging.warning(
-                    f"Truncating training example's text_ids of length {len(text_ids)} by {trunc_len} because {endpos=} > {len(tokens)=}. {diagnostic}"
-                )
-                text_ids = text_ids[:trunc_len]
-                endpos = pos + len(text_ids)  
-
-            try:
-                tokens[pos:endpos] = text_ids
-            except Exception as e:
-                raise RuntimeError(f"{tokens.shape=} {pos=} {endpos=} {text_ids.shape=} {diagnostic}") from e
-
-            if eospos < len(tokens):
-                tokens[eospos] = tokenizer.eos
-
+        if tgt_end_pos < len(tokens):
+            tokens[tgt_end_pos] = tokenizer.eos
+        else:
+            tokens = torch.cat([tokens, torch.tensor([tokenizer.eos], dtype=torch.long)])
+            
     return tokens
 
 def _strip_timestamps(

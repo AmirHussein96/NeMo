@@ -27,7 +27,7 @@ from nemo.collections.speechlm2.data.utils import get_pad_id
 from nemo.utils import logging
 
 
-class DuplexS2SDataset(torch.utils.data.Dataset):
+class DuplexS2SDatasetSrcSpk(torch.utils.data.Dataset):
     """
     A dataset for duplex speech-to-speech models that handles bidirectional conversations.
 
@@ -114,13 +114,12 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             cuts, self.tokenizer, self.frame_length, roles=self.input_roles
         )
         # extract target speaker first turn audio to uses for speaker conditioning
-        target_first_turn_audio, target_first_turn_audio_lens = collate_first_turn_audio(
-            cuts.resample(self.target_sample_rate), roles=self.output_roles, recording_field="target_audio"
-        )
-        # target_first_turn_audio, target_first_turn_audio_lens = collate_first_turn_audio_source(
-        #     cuts.resample(self.target_sample_rate), roles=self.input_roles,
+        # target_first_turn_audio, target_first_turn_audio_lens = collate_first_turn_audio(
+        #     cuts.resample(self.target_sample_rate), roles=self.output_roles, recording_field="target_audio"
         # )
-
+        first_turn_audio, first_turn_audio_lens = collate_first_turn_audio_source(
+            cuts.resample(self.target_sample_rate), roles=self.input_roles
+        )
 
         return {
             "sample_id": [str(cut.id) for cut in cuts],
@@ -135,8 +134,8 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             "target_texts": [
                 " ".join(s.text for s in cut.supervisions if s.speaker in self.output_roles) for cut in cuts
             ],
-            "first_turn_audio": target_first_turn_audio,
-            "first_turn_audio_lens": target_first_turn_audio_lens,
+            "first_turn_audio": first_turn_audio,
+            "first_turn_audio_lens": first_turn_audio_lens,
             "formatter": [getattr(cut, "formatter", "s2s_duplex") for cut in cuts],
         }
 
@@ -200,11 +199,14 @@ def build_token_channel(
         diagnostic = f"{diagnostic} {cut.shard_origin=}"
     total = compute_num_frames(cut.duration, frame_length, cut.sampling_rate)
     tokens = torch.ones(total, dtype=torch.long) * pad_id
-
+    i = 0
     for supervision in cut.supervisions:
         if supervision.speaker in roles:
-            text_ids = torch.as_tensor([tokenizer.bos] + tokenizer.text_to_ids(supervision.text))
-
+            if i == 0:
+                text_ids = torch.as_tensor([tokenizer.bos] + tokenizer.text_to_ids(supervision.text))
+            else:
+                text_ids = torch.as_tensor([tokenizer.bos] + tokenizer.text_to_ids(" " + supervision.text))
+            i += 1
             pos = compute_num_frames(supervision.start, frame_length, cut.sampling_rate)
             if pos >= len(tokens):  # Changed from > to >= for robustness
                 logging.warning(
@@ -240,9 +242,9 @@ def build_token_channel(
             except Exception as e:
                 raise RuntimeError(f"{tokens.shape=} {pos=} {endpos=} {text_ids.shape=} {diagnostic}") from e
 
-            if eospos < len(tokens):
-                tokens[eospos] = tokenizer.eos
-
+            # if eospos < len(tokens):
+            #     tokens[eospos] = tokenizer.eos
+    tokens[-1] = tokenizer.eos
     return tokens
 
 def _strip_timestamps(

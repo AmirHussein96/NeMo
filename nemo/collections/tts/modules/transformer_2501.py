@@ -686,7 +686,7 @@ class Transformer(torch.nn.Module):
                 f"Insufficient Transformer layers for multiple conditionals. Each layer must cross-attend one conditional."
                 f"Found {len(self.layers)} layers for {len(cond)} conditionals."
             )
-
+     
         if self.use_learnable_pos_emb:
             positions = torch.arange(x.size(1), device=x.device).unsqueeze(0)
             x = x + self.position_embeddings(positions)
@@ -697,6 +697,7 @@ class Transformer(torch.nn.Module):
             _cond, _cond_mask, _attn_prior = self._get_layer_inputs(
                 idx, cond, cond_mask, attn_prior, multi_encoder_mapping
             )
+        
             out_dict = layer(x, x_mask, _cond, _cond_mask, attn_prior=_attn_prior)
             x = out_dict['output']
             attn_probabilities.append(out_dict['attn_probabilities'])

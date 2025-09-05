@@ -37,7 +37,6 @@ def train(cfg):
 
     with trainer.init_module():
         model = DuplexS2SSpeechDecoderModel(OmegaConf.to_container(cfg, resolve=True))
-
     dataset = DuplexS2SDataset(
         tokenizer=model.tokenizer,
         frame_length=cfg.data.frame_length,

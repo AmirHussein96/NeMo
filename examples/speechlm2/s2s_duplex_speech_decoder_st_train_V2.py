@@ -17,7 +17,7 @@ import torch
 from lightning.pytorch import Trainer
 from omegaconf import OmegaConf
 
-from nemo.collections.speechlm2 import DataModule, DuplexS2SDataset, DuplexS2SSpeechDecoderModel
+from nemo.collections.speechlm2 import DataModule, DuplexS2SDatasetSrcSpk, DuplexS2SSpeechDecoderModel
 from nemo.core.config import hydra_runner
 from nemo.utils.exp_manager import exp_manager
 from nemo.utils.trainer_utils import resolve_trainer_cfg
@@ -26,7 +26,7 @@ torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
 
 @hydra_runner(config_path="conf", config_name="s2s_duplex_speech_decoder")
-def inference(cfg):
+def train(cfg):
     OmegaConf.resolve(cfg)
     torch.distributed.init_process_group(backend="nccl")
     torch.set_float32_matmul_precision("medium")
@@ -37,18 +37,18 @@ def inference(cfg):
 
     with trainer.init_module():
         model = DuplexS2SSpeechDecoderModel(OmegaConf.to_container(cfg, resolve=True))
-    dataset = DuplexS2SDataset(
+    dataset = DuplexS2SDatasetSrcSpk(
         tokenizer=model.tokenizer,
         frame_length=cfg.data.frame_length,
         source_sample_rate=cfg.data.source_sample_rate,
         target_sample_rate=cfg.data.target_sample_rate,
         input_roles=cfg.data.input_roles,
-        output_roles=cfg.data.output_roles,
+        output_roles=cfg.data.output_roles
     )
     datamodule = DataModule(cfg.data, tokenizer=model.tokenizer, dataset=dataset)
 
-    trainer.validate(model, datamodule)
+    trainer.fit(model, datamodule)
 
 
 if __name__ == "__main__":
-    inference()
+    train()

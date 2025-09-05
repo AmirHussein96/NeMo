@@ -243,6 +243,7 @@ class TransformerARSpeechDecoder(NeuralModule):
     ):
         super().__init__()
         self.use_input_cache = False
+        self.use_random_spk_emb = False
         self.speech_decoder_parms = speech_decoder_parms
         self.lantent_dim = lantent_dim
         self.num_audio_codebooks = num_audio_codebooks
@@ -279,6 +280,7 @@ class TransformerARSpeechDecoder(NeuralModule):
 
 
             # generate a random speaker embedding
+            
             inference_speaker_embedding = torch.randn([1, 1, self.speaker_embedding_dim])
             self.register_buffer("inference_speaker_embedding", inference_speaker_embedding)
             # if inference_speaker_reference is provided, replace random embedding by the reference speaker embedding
@@ -366,6 +368,9 @@ class TransformerARSpeechDecoder(NeuralModule):
         audio, sr = torchaudio.load(audio_path)
         audio_len = torch.tensor([audio.size(1)]).long()
         self.inference_speaker_embedding = self.get_speaker_embedding(audio.to(self.device), audio_len.to(self.device), sr)
+    
+    def update_inference_speaker_embedding_from_embedding(self, embedding):
+        self.inference_speaker_embedding = embedding
 
     def get_speaker_embedding(self, audio, audio_len, sr):
         # limit max audio len to avoid memory waste
@@ -522,7 +527,11 @@ class TransformerARSpeechDecoder(NeuralModule):
             if self.use_input_cache and not self.training:
                 speaker_encoder_emb = self.inference_speaker_embedding
                 # repeat speaker encoder embedding to match the time and batch dimention
-                speaker_encoder_emb = speaker_encoder_emb.repeat(speech_decoder_input.size(0), speech_decoder_input.size(1), 1)
+                if self.use_random_spk_emb:
+                    speaker_encoder_emb = speaker_encoder_emb.repeat(speech_decoder_input.size(0), speech_decoder_input.size(1), 1)
+                
+                if speaker_encoder_emb.size(1) != speech_decoder_input.size(1):
+                    speaker_encoder_emb = speaker_encoder_emb.repeat(1, speech_decoder_input.size(1), 1)
             else:
                 # repeat speaker encoder embedding to match the time dimention
                 if speaker_encoder_emb.size(1) != speech_decoder_input.size(1):
@@ -558,7 +567,6 @@ class TransformerARSpeechDecoder(NeuralModule):
         if self.cond_on_prev_audio_tokens:
             if self.detach_input:
                 input_audio_tokens = input_audio_tokens.detach()
-
             audio_tokens_embedded = self.embed_audio_tokens(
                 input_audio_tokens.transpose(1, 2).contiguous()
             )  # (B, T', E)
@@ -568,8 +576,9 @@ class TransformerARSpeechDecoder(NeuralModule):
                 gate = torch.sigmoid(self.audio_gate_proj(gate_input))
                 speech_decoder_input = gate * speech_decoder_input + (1 - gate) * audio_tokens_embedded
             else:
+                
                 speech_decoder_input = speech_decoder_input + audio_tokens_embedded
-
+        
         decoder_out = self.t5_decoder(x=speech_decoder_input, x_mask=speech_mask)['output']
 
         # if it is true we need to return just the last autoregressive step, it is valid because for 1 frame input we produce 1 frame ouput

@@ -463,8 +463,9 @@ def get_lhotse_sampler_from_config(config, global_rank, world_size, tokenizer=No
         cuts = cuts.map(partial(_select_channel, channel_selector=config.channel_selector))
 
     # Resample as a safeguard; it's a no-op when SR is already OK
+    # if config.sample_rate and config.sample_rate != cuts[0].sampling_rate:
+    #     cuts = cuts.resample(config.sample_rate)
     cuts = cuts.resample(config.sample_rate)
-
     # Expands cuts if multiple translations are provided.
     cuts = CutSet(LazyFlattener(cuts.map(_flatten_alt_text, apply_fn=None)))
 
