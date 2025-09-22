@@ -22,13 +22,16 @@ from typing import List, Optional
 import torch
 from omegaconf import OmegaConf
 from utils.data_prep import (
+    add_t_start_end_to_utt_obj,
     get_batch_starts_ends,
+    get_batch_variables,
     get_manifest_lines_batch,
     is_entry_in_all_lines,
     is_entry_in_any_lines,
+    load_nemo_tarred_from_dir,
 )
 from utils.make_ass_files import make_ass_files
-from utils.make_ctm_files import make_ctm_files
+from utils.make_ctm_files import combine_and_cleanup_ctms, make_ctm_files
 from utils.make_output_manifest import write_manifest_out_line
 
 from nemo.collections.asr.models.ctc_models import EncDecCTCModel
@@ -52,6 +55,7 @@ except ImportError:
         "Or install the latest development version:\n"
         "  pip install git+https://github.com/NVIDIA/NeMo.git"
     )
+
 """
 Align the utterances in manifest_filepath. 
 Results are saved in ctm files in output_dir.
@@ -79,7 +83,7 @@ Arguments:
     use_local_attention: boolean flag specifying whether to try to use local attention for the ASR Model (will only
         work if the ASR Model is a Conformer model). If local attention is used, we will set the local attention context 
         size to [64,64].
-    additional_segment_grouping_separator: an optional string or list of strings used to separate the text into smaller segments. 
+    additional_segment_grouping_separator: an optional string used to separate the text into smaller segments. 
         If this is not specified, then the whole text will be treated as a single segment. 
     remove_blank_tokens_from_ctm:  a boolean denoting whether to remove <blank> tokens from token-level output CTMs. 
     audio_filepath_parts_in_utt_id: int specifying how many of the 'parts' of the audio_filepath
@@ -105,6 +109,7 @@ Arguments:
     save_output_file_formats: List of strings specifying what type of output files to save (default: ["ctm", "ass"])
     ctm_file_config: CTMFileConfig to specify the configuration of the output CTM files
     ass_file_config: ASSFileConfig to specify the configuration of the output ASS files
+    tar_path: Optional[str] = None
 """
 
 
@@ -146,8 +151,9 @@ class AlignmentConfig:
     viterbi_device: Optional[str] = None
     batch_size: int = 1
     use_local_attention: bool = True
-    additional_segment_grouping_separator: Optional[List[str]] = field(default_factory=lambda: ['.', '?', '!', '...'])
+    additional_segment_grouping_separator: Optional[str] = None
     audio_filepath_parts_in_utt_id: int = 1
+    combine_ctms: bool = False
 
     # Buffered chunked streaming configs
     use_buffered_chunked_streaming: bool = False
@@ -162,6 +168,12 @@ class AlignmentConfig:
     save_output_file_formats: List[str] = field(default_factory=lambda: ["ctm", "ass"])
     ctm_file_config: CTMFileConfig = field(default_factory=lambda: CTMFileConfig())
     ass_file_config: ASSFileConfig = field(default_factory=lambda: ASSFileConfig())
+
+    # load lhotse tarred dataset
+    load_lhotse_tarred: Optional[bool] = False
+
+    # New field
+    tar_path: Optional[str] = None
 
 
 @hydra_runner(config_name="AlignmentConfig", schema=AlignmentConfig)
@@ -190,12 +202,6 @@ def main(cfg: AlignmentConfig):
 
     if cfg.additional_segment_grouping_separator == "" or cfg.additional_segment_grouping_separator == " ":
         raise ValueError("cfg.additional_grouping_separator cannot be empty string or space character")
-    elif cfg.additional_segment_grouping_separator is not None and cfg.additional_segment_grouping_separator != []:
-        logging.warning(
-            f"`additional_segment_grouping_separator` is set to {cfg.additional_segment_grouping_separator}. "
-            "BEHAVIOR CHANGE: Starting in NeMo 2.5.0, separators are preserved in segment text after splitting. "
-            "In previous versions, separators were removed. This affects the behavior of NFA."
-        )
 
     if cfg.ctm_file_config.minimum_timestamp_duration < 0:
         raise ValueError("cfg.minimum_timestamp_duration cannot be a negative number")
@@ -316,8 +322,6 @@ def main(cfg: AlignmentConfig):
             "model_stride_in_secs": model_stride_in_secs,
             "tokens_per_chunk": tokens_per_chunk,
         }
-    # get start and end line IDs of batches
-    starts, ends = get_batch_starts_ends(cfg.manifest_filepath, cfg.batch_size)
 
     # init output_timestep_duration = None and we will calculate and update it during the first batch
     output_timestep_duration = None
@@ -328,57 +332,108 @@ def main(cfg: AlignmentConfig):
     tgt_manifest_filepath = str(Path(cfg.output_dir) / tgt_manifest_name)
     f_manifest_out = open(tgt_manifest_filepath, 'w')
 
-    # get alignment and save in CTM batch-by-batch
-    for start, end in zip(starts, ends):
-        manifest_lines_batch = get_manifest_lines_batch(cfg.manifest_filepath, start, end)
+    if cfg.load_lhotse_tarred:
+        print(f"load_lhotse_tarred: {cfg.load_lhotse_tarred}")
+        if cfg.tar_path is None:
+            # check if tar_path is provided
+            raise ValueError("When load_lhotse_tarred is True, tar_path must be provided.")
+        # create cuts from tarred dataset
+        cuts = load_nemo_tarred_from_dir(cfg.manifest_filepath, cfg.tar_path)
 
-        if not cfg.align_using_pred_text:
-            gt_text_batch = [line.get('text', '') for line in manifest_lines_batch]
-        else:
-            gt_text_batch = None
+        for i in range(0, len(cuts), cfg.batch_size):
+            batch_cuts = cuts[i : i + cfg.batch_size] if i + cfg.batch_size < len(cuts) else cuts[i:]
+            (
+                log_probs_batch,
+                y_batch,
+                T_batch,
+                U_batch,
+                utt_obj_batch,
+                output_timestep_duration,
+            ) = get_batch_variables(
+                batch_cuts,
+                model,
+                cfg.additional_segment_grouping_separator,
+                cfg.align_using_pred_text,
+                cfg.audio_filepath_parts_in_utt_id,
+                output_timestep_duration,
+                cfg.simulate_cache_aware_streaming,
+                cfg.use_buffered_chunked_streaming,
+                buffered_chunk_params,
+                cfg.load_lhotse_tarred,
+            )
+            alignments_batch = viterbi_decoding(log_probs_batch, y_batch, T_batch, U_batch, viterbi_device)
 
-        (
-            log_probs_batch,
-            y_batch,
-            T_batch,
-            U_batch,
-            utt_obj_batch,
-            output_timestep_duration,
-        ) = get_batch_variables(
-            audio=[line['audio_filepath'] for line in manifest_lines_batch],
-            model=model,
-            segment_separators=cfg.additional_segment_grouping_separator,
-            align_using_pred_text=cfg.align_using_pred_text,
-            audio_filepath_parts_in_utt_id=cfg.audio_filepath_parts_in_utt_id,
-            gt_text_batch=gt_text_batch,
-            output_timestep_duration=output_timestep_duration,
-            simulate_cache_aware_streaming=cfg.simulate_cache_aware_streaming,
-            use_buffered_chunked_streaming=cfg.use_buffered_chunked_streaming,
-            buffered_chunk_params=buffered_chunk_params,
-        )
+            for utt_obj, alignment_utt in zip(utt_obj_batch, alignments_batch):
 
-        alignments_batch = viterbi_decoding(log_probs_batch, y_batch, T_batch, U_batch, viterbi_device)
+                utt_obj = add_t_start_end_to_utt_obj(utt_obj, alignment_utt, output_timestep_duration)
 
-        for utt_obj, alignment_utt in zip(utt_obj_batch, alignments_batch):
+                if "ctm" in cfg.save_output_file_formats:
+                    utt_obj = make_ctm_files(
+                        utt_obj,
+                        cfg.output_dir,
+                        cfg.ctm_file_config,
+                    )
 
-            utt_obj = add_t_start_end_to_utt_obj(utt_obj, alignment_utt, output_timestep_duration)
+                if "ass" in cfg.save_output_file_formats:
+                    utt_obj = make_ass_files(utt_obj, cfg.output_dir, cfg.ass_file_config)
 
-            if "ctm" in cfg.save_output_file_formats:
-                utt_obj = make_ctm_files(
+                write_manifest_out_line(
+                    f_manifest_out,
                     utt_obj,
-                    cfg.output_dir,
-                    cfg.ctm_file_config,
                 )
+        f_manifest_out.close()
 
-            if "ass" in cfg.save_output_file_formats:
-                utt_obj = make_ass_files(utt_obj, cfg.output_dir, cfg.ass_file_config)
+    # get start and end line IDs of batches
+    else:
+        starts, ends = get_batch_starts_ends(cfg.manifest_filepath, cfg.batch_size)
+        # get alignment and save in CTM batch-by-batch
+        for start, end in zip(starts, ends):
+            manifest_lines_batch = get_manifest_lines_batch(cfg.manifest_filepath, start, end)
 
-            write_manifest_out_line(
-                f_manifest_out,
-                utt_obj,
+            (
+                log_probs_batch,
+                y_batch,
+                T_batch,
+                U_batch,
+                utt_obj_batch,
+                output_timestep_duration,
+            ) = get_batch_variables(
+                manifest_lines_batch,
+                model,
+                cfg.additional_segment_grouping_separator,
+                cfg.align_using_pred_text,
+                cfg.audio_filepath_parts_in_utt_id,
+                output_timestep_duration,
+                cfg.simulate_cache_aware_streaming,
+                cfg.use_buffered_chunked_streaming,
+                buffered_chunk_params,
             )
 
-    f_manifest_out.close()
+            alignments_batch = viterbi_decoding(log_probs_batch, y_batch, T_batch, U_batch, viterbi_device)
+
+            for utt_obj, alignment_utt in zip(utt_obj_batch, alignments_batch):
+
+                utt_obj = add_t_start_end_to_utt_obj(utt_obj, alignment_utt, output_timestep_duration)
+
+                if "ctm" in cfg.save_output_file_formats:
+                    utt_obj = make_ctm_files(
+                        utt_obj,
+                        cfg.output_dir,
+                        cfg.ctm_file_config,
+                    )
+
+                if "ass" in cfg.save_output_file_formats:
+                    utt_obj = make_ass_files(utt_obj, cfg.output_dir, cfg.ass_file_config)
+
+                write_manifest_out_line(
+                    f_manifest_out,
+                    utt_obj,
+                )
+
+        f_manifest_out.close()
+
+    if cfg.combine_ctms:
+        combine_and_cleanup_ctms(cfg.output_dir)
 
     return None
 
