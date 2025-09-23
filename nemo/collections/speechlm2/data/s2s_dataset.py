@@ -114,12 +114,12 @@ class DuplexS2SDataset(torch.utils.data.Dataset):
             cuts, self.tokenizer, self.frame_length, roles=self.input_roles
         )
         # extract target speaker first turn audio to uses for speaker conditioning
-        target_first_turn_audio, target_first_turn_audio_lens = collate_first_turn_audio(
-            cuts.resample(self.target_sample_rate), roles=self.output_roles, recording_field="target_audio"
-        )
-        # target_first_turn_audio, target_first_turn_audio_lens = collate_first_turn_audio_source(
-        #     cuts.resample(self.target_sample_rate), roles=self.input_roles,
+        # target_first_turn_audio, target_first_turn_audio_lens = collate_first_turn_audio(
+        #     cuts.resample(self.target_sample_rate), roles=self.output_roles, recording_field="target_audio"
         # )
+        target_first_turn_audio, target_first_turn_audio_lens = collate_first_turn_audio_source(
+            cuts.resample(self.target_sample_rate), roles=self.input_roles,
+        )
 
 
         return {
