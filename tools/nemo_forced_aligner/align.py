@@ -325,7 +325,8 @@ def main(cfg: AlignmentConfig):
             raise ValueError("When load_lhotse_tarred is True, tar_path must be provided.")
         # create cuts from tarred dataset
         cuts = load_nemo_tarred_from_dir(cfg.manifest_filepath, cfg.tar_path)
-
+        cuts = cuts.trim_to_supervisions(keep_overlapping=False)
+        cuts = cuts.to_eager()
         for i in range(0, len(cuts), cfg.batch_size):
             batch_cuts = cuts[i : i + cfg.batch_size] if i + cfg.batch_size < len(cuts) else cuts[i:]
             (
