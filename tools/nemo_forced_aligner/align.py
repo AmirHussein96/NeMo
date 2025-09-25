@@ -312,7 +312,7 @@ def main(cfg: AlignmentConfig):
         }
 
     # init output_timestep_duration = None and we will calculate and update it during the first batch
-
+    output_timestep_duration = cfg.output_timestep_duration
     # init f_manifest_out
     os.makedirs(cfg.output_dir, exist_ok=True)
     tgt_manifest_name = str(Path(cfg.manifest_filepath).stem) + "_with_output_file_paths.json"
