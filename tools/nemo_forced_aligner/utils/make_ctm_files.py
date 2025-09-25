@@ -19,13 +19,12 @@ import shutil
 import soundfile as sf
 from utils.constants import BLANK_TOKEN, SPACE_TOKEN
 from utils.data_prep import Segment, Word
-
 from nemo.collections.asr.parts.utils.manifest_utils import get_ctm_line
 
 
 def combine_and_cleanup_ctms(output_dir, alignment_levels=("tokens", "words", "segments")):
     ctm_dir = os.path.join(output_dir, "ctm")
-
+    os.makedirs(ctm_dir, exist_ok=True)
     for level in alignment_levels:
         level_dir = os.path.join(ctm_dir, level)
         combined_ctm_path = os.path.join(ctm_dir, f"{level}.combined.ctm")
@@ -33,11 +32,36 @@ def combine_and_cleanup_ctms(output_dir, alignment_levels=("tokens", "words", "s
         if not os.path.exists(level_dir):
             continue  # Skip if folder doesn't exist
 
+        # Collect lines
+        lines = []
+        for ctm_file in glob.glob(os.path.join(level_dir, "*.ctm")):
+            with open(ctm_file, "r", encoding="utf-8") as fin:
+                lines.extend(fin.readlines())
+        # Sort by utt_id (col 0) then start time (col 2)
+        def _key(line: str):
+            parts = line.strip().split()
+            utt_id = parts[0] if parts else ""
+            try:
+                start = float(parts[2])
+            except Exception:
+                start = float("inf")
+            return (utt_id, start)
+
+        lines.sort(key=_key)
+        # --- de-duplicate while preserving order ---
+        seen = set()
+        uniq = []
+        for ln in lines:
+            if ln not in seen:
+                seen.add(ln)
+                uniq.append(ln)
+        lines = uniq
         # Combine all .ctm files into one
         with open(combined_ctm_path, "w", encoding="utf-8") as fout:
-            for ctm_file in glob.glob(os.path.join(level_dir, "*.ctm")):
-                with open(ctm_file, "r", encoding="utf-8") as fin:
-                    fout.writelines(fin)
+            fout.writelines(lines)
+            # for ctm_file in glob.glob(os.path.join(level_dir, "*.ctm")):
+                # with open(ctm_file, "r", encoding="utf-8") as fin:
+                    # fout.writelines(fin)
 
         # Remove the entire per-level folder
         shutil.rmtree(level_dir)

@@ -146,6 +146,7 @@ class AlignmentConfig:
     chunk_len_in_secs: float = 1.6
     total_buffer_in_secs: float = 4.0
     chunk_batch_size: int = 32
+    output_timestep_duration: Optional[float] = None
 
     # Cache aware streaming configs
     simulate_cache_aware_streaming: Optional[bool] = False
@@ -160,6 +161,7 @@ class AlignmentConfig:
 
     # New field
     tar_path: Optional[str] = None
+    
 
 
 @hydra_runner(config_name="AlignmentConfig", schema=AlignmentConfig)
@@ -310,7 +312,6 @@ def main(cfg: AlignmentConfig):
         }
 
     # init output_timestep_duration = None and we will calculate and update it during the first batch
-    output_timestep_duration = None
 
     # init f_manifest_out
     os.makedirs(cfg.output_dir, exist_ok=True)
@@ -349,9 +350,7 @@ def main(cfg: AlignmentConfig):
                 cfg.load_lhotse_tarred,
             )
             alignments_batch = viterbi_decoding(log_probs_batch, y_batch, T_batch, U_batch, viterbi_device)
-
             for utt_obj, alignment_utt in zip(utt_obj_batch, alignments_batch):
-
                 utt_obj = add_t_start_end_to_utt_obj(utt_obj, alignment_utt, output_timestep_duration)
 
                 if "ctm" in cfg.save_output_file_formats:
