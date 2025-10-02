@@ -787,7 +787,6 @@ def get_batch_variables(
     y_list_batch = []
     U_list_batch = []
     utt_obj_batch = []
-    # breakpoint()
     for i_line, line in enumerate(manifest_lines_batch):
         if align_using_pred_text:
             gt_text_for_alignment = " ".join(pred_text_batch[i_line].split())

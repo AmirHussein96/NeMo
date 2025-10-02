@@ -78,7 +78,6 @@ def make_ctm_files(
 
     # don't try to make files if utt_obj.segments_and_tokens is empty, which will happen
     # in the case of the ground truth text being empty or the number of tokens being too large vs audio duration
-    # breakpoint()
     if not utt_obj.segments_and_tokens:
         return utt_obj
 
@@ -124,7 +123,6 @@ def make_ctm(
     output_dir = os.path.join(output_dir_root, "ctm", alignment_level)
     os.makedirs(output_dir, exist_ok=True)
 
-    # breakpoint()
     boundary_info_utt = []
     for segment_or_token in utt_obj.segments_and_tokens:
         if type(segment_or_token) is Segment:
