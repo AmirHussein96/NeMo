@@ -161,6 +161,8 @@ class AlignmentConfig:
 
     # New field
     tar_path: Optional[str] = None
+    # Use segment time in id : sessionid_spk__stime_etime
+    time_id: Optional[bool] = False
     
 
 
@@ -326,6 +328,8 @@ def main(cfg: AlignmentConfig):
             raise ValueError("When load_lhotse_tarred is True, tar_path must be provided.")
         # create cuts from tarred dataset
         cuts = load_nemo_tarred_from_dir(cfg.manifest_filepath, cfg.tar_path)
+        breakpoint()
+        cuts = cuts.filter(lambda x: x.id == "_lustre_fs12_portfolios_llmservice_projects_llmservice_nemo_mlops_full-duplex_data_speech_davidai_all16k_manifests_wavs_0e9484c3-f939-43f8-ac8c-57a0e0b484b4_speaker1.wav")
         cuts = cuts.trim_to_supervisions(keep_overlapping=False)
         cuts = cuts.to_eager()
         for i in range(0, len(cuts), cfg.batch_size):
@@ -348,8 +352,10 @@ def main(cfg: AlignmentConfig):
                 cfg.use_buffered_chunked_streaming,
                 buffered_chunk_params,
                 cfg.load_lhotse_tarred,
+                time_id=cfg.time_id
             )
             alignments_batch = viterbi_decoding(log_probs_batch, y_batch, T_batch, U_batch, viterbi_device)
+            breakpoint()
             for utt_obj, alignment_utt in zip(utt_obj_batch, alignments_batch):
                 utt_obj = add_t_start_end_to_utt_obj(utt_obj, alignment_utt, output_timestep_duration)
 

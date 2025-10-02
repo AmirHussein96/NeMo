@@ -714,6 +714,7 @@ def get_batch_variables(
     use_buffered_chunked_streaming=False,
     buffered_chunk_params={},
     load_lhotse_tarred=False,
+    time_id=False,
 ):
     """
     Returns:
@@ -786,7 +787,7 @@ def get_batch_variables(
     y_list_batch = []
     U_list_batch = []
     utt_obj_batch = []
-
+    # breakpoint()
     for i_line, line in enumerate(manifest_lines_batch):
         if align_using_pred_text:
             gt_text_for_alignment = " ".join(pred_text_batch[i_line].split())
@@ -796,13 +797,21 @@ def get_batch_variables(
                 time_offset = manifest_lines_batch[i_line].custom.get("offset", 0)
             else:
                 gt_text_for_alignment = line["text"]
+        # use the time information in ids 
+        if time_id:
+            # utt_id = f"{manifest_lines_batch[i_line].custom.get('session_id')}_speaker{manifest_lines_batch[i_line].custom.get('speaker')}__{manifest_lines_batch[i_line].custom.get('start_time')}_{manifest_lines_batch[i_line].custom.get('end_time')}"
+            # print(utt_id)
+            utt_id = f"{manifest_lines_batch[i_line].custom.get('session_id')}_speaker{manifest_lines_batch[i_line].custom.get('speaker')}"
+        else:
+            utt_id = _get_utt_id(audio_filepaths_batch[i_line], audio_filepath_parts_in_utt_id)
+        
         utt_obj = get_utt_obj(
             gt_text_for_alignment,
             model,
             separator,
             T_list_batch[i_line],
             audio_filepaths_batch[i_line],
-            _get_utt_id(audio_filepaths_batch[i_line], audio_filepath_parts_in_utt_id),
+            utt_id,
         )
         utt_obj.time_offset = time_offset
         # update utt_obj.pred_text or utt_obj.text
