@@ -328,7 +328,6 @@ def main(cfg: AlignmentConfig):
             raise ValueError("When load_lhotse_tarred is True, tar_path must be provided.")
         # create cuts from tarred dataset
         cuts = load_nemo_tarred_from_dir(cfg.manifest_filepath, cfg.tar_path)
-        cuts = cuts.filter(lambda x: x.id == "_lustre_fs12_portfolios_llmservice_projects_llmservice_nemo_mlops_full-duplex_data_speech_davidai_all16k_manifests_wavs_0e9484c3-f939-43f8-ac8c-57a0e0b484b4_speaker1.wav")
         cuts = cuts.trim_to_supervisions(keep_overlapping=False)
         cuts = cuts.to_eager()
         for i in range(0, len(cuts), cfg.batch_size):

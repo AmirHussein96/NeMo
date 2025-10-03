@@ -798,9 +798,9 @@ def get_batch_variables(
                 gt_text_for_alignment = line["text"]
         # use the time information in ids 
         if time_id:
-            # utt_id = f"{manifest_lines_batch[i_line].custom.get('session_id')}_speaker{manifest_lines_batch[i_line].custom.get('speaker')}__{manifest_lines_batch[i_line].custom.get('start_time')}_{manifest_lines_batch[i_line].custom.get('end_time')}"
+            utt_id = f"{manifest_lines_batch[i_line].custom.get('session_id')}_speaker{manifest_lines_batch[i_line].custom.get('speaker')}__{manifest_lines_batch[i_line].custom.get('start_time')}_{manifest_lines_batch[i_line].custom.get('end_time')}"
             # print(utt_id)
-            utt_id = f"{manifest_lines_batch[i_line].custom.get('session_id')}_speaker{manifest_lines_batch[i_line].custom.get('speaker')}"
+            # utt_id = f"{manifest_lines_batch[i_line].custom.get('session_id')}_speaker{manifest_lines_batch[i_line].custom.get('speaker')}"
         else:
             utt_id = _get_utt_id(audio_filepaths_batch[i_line], audio_filepath_parts_in_utt_id)
         
