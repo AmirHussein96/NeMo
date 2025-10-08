@@ -656,47 +656,47 @@ def add_t_start_end_to_utt_obj(utt_obj, alignment_utt, output_timestep_duration)
     num_to_last_alignment_appearance[prev_s] = len(alignment_utt) - 1
 
     # update all the t_start and t_end in utt_obj
-    offset_sec = utt_obj.time_offset
+    # offset_sec = utt_obj.time_offset
     for segment_or_token in utt_obj.segments_and_tokens:
         if type(segment_or_token) is Segment:
             segment = segment_or_token
-            segment.t_start = num_to_first_alignment_appearance[segment.s_start] * output_timestep_duration + offset_sec
-            segment.t_end   = (num_to_last_alignment_appearance[segment.s_end] + 1) * output_timestep_duration + offset_sec
+            segment.t_start = num_to_first_alignment_appearance[segment.s_start] * output_timestep_duration 
+            segment.t_end   = (num_to_last_alignment_appearance[segment.s_end] + 1) * output_timestep_duration 
 
             for word_or_token in segment.words_and_tokens:
                 if type(word_or_token) is Word:
                     word = word_or_token
-                    word.t_start = num_to_first_alignment_appearance[word.s_start] * output_timestep_duration + offset_sec
-                    word.t_end   = (num_to_last_alignment_appearance[word.s_end] + 1) * output_timestep_duration + offset_sec
+                    word.t_start = num_to_first_alignment_appearance[word.s_start] * output_timestep_duration 
+                    word.t_end   = (num_to_last_alignment_appearance[word.s_end] + 1) * output_timestep_duration
 
                     for token in word.tokens:
                         if token.s_start in num_to_first_alignment_appearance:
-                            token.t_start = num_to_first_alignment_appearance[token.s_start] * output_timestep_duration + offset_sec
+                            token.t_start = num_to_first_alignment_appearance[token.s_start] * output_timestep_duration
                         else:
                             token.t_start = -1
                         if token.s_end in num_to_last_alignment_appearance:
-                            token.t_end = (num_to_last_alignment_appearance[token.s_end] + 1) * output_timestep_duration + offset_sec
+                            token.t_end = (num_to_last_alignment_appearance[token.s_end] + 1) * output_timestep_duration
                         else:
                             token.t_end = -1
                 else:
                     token = word_or_token
                     if token.s_start in num_to_first_alignment_appearance:
-                        token.t_start = num_to_first_alignment_appearance[token.s_start] * output_timestep_duration + offset_sec
+                        token.t_start = num_to_first_alignment_appearance[token.s_start] * output_timestep_duration
                     else:
                         token.t_start = -1
                     if token.s_end in num_to_last_alignment_appearance:
-                        token.t_end = (num_to_last_alignment_appearance[token.s_end] + 1) * output_timestep_duration + offset_sec
+                        token.t_end = (num_to_last_alignment_appearance[token.s_end] + 1) * output_timestep_duration
                     else:
                         token.t_end = -1
 
         else:
             token = segment_or_token
             if token.s_start in num_to_first_alignment_appearance:
-                token.t_start = num_to_first_alignment_appearance[token.s_start] * output_timestep_duration + offset_sec
+                token.t_start = num_to_first_alignment_appearance[token.s_start] * output_timestep_duration
             else:
                 token.t_start = -1
             if token.s_end in num_to_last_alignment_appearance:
-                token.t_end = (num_to_last_alignment_appearance[token.s_end] + 1) * output_timestep_duration + offset_sec
+                token.t_end = (num_to_last_alignment_appearance[token.s_end] + 1) * output_timestep_duration
             else:
                 token.t_end = -1
 
