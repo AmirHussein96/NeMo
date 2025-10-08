@@ -329,6 +329,8 @@ def main(cfg: AlignmentConfig):
         # create cuts from tarred dataset
         cuts = load_nemo_tarred_from_dir(cfg.manifest_filepath, cfg.tar_path)
         cuts = cuts.trim_to_supervisions(keep_overlapping=False)
+        # please change the minimum duration if needed
+        cuts = cuts.filter(lambda c: c.duration > 0.5)
         cuts = cuts.to_eager()
         for i in range(0, len(cuts), cfg.batch_size):
             batch_cuts = cuts[i : i + cfg.batch_size] if i + cfg.batch_size < len(cuts) else cuts[i:]
