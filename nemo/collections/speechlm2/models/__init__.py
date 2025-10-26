@@ -14,6 +14,7 @@
 from .duplex_s2s_model import DuplexS2SModel
 from .duplex_s2s_speech_decoder_model import DuplexS2SSpeechDecoderModel
 from .duplex_s2s_speech_decoder_st_model import DuplexS2SSpeechDecoderModelST
+from .duplex_s2s_speech_decoder_model2 import DuplexS2SSpeechDecoderModel2
 from .salm import SALM
 
 __all__ = [
@@ -21,4 +22,5 @@ __all__ = [
     'DuplexS2SSpeechDecoderModel',
     'DuplexS2SSpeechDecoderModelST',
     'SALM',
+    'DuplexS2SSpeechDecoderModel2',
 ]

@@ -101,7 +101,7 @@ def delay_eos(tokens, eos_token_id, pad_token_id, shift=10):
     return tokens
 
 
-class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
+class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
     def __init__(self, cfg: dict) -> None:
         assert isinstance(cfg, dict), (
             "You must pass the config to DuplexS2SModel as a Python dict to support hyperparameter serialization "
@@ -1053,20 +1053,43 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         B, T_local, H = source_encoded.shape
 
         # Determine decoding length and pad if FSDP
-        if self._use_fsdp:
-            T_tensor = torch.tensor([T_local], device=source_encoded.device)
-            dist.all_reduce(T_tensor, op=dist.ReduceOp.MAX)
-            T = int(T_tensor.item())
-            if T > T_local:
+        # if self._use_fsdp:
+        #     T_tensor = torch.tensor([T_local], device=source_encoded.device)
+        #     dist.all_reduce(T_tensor, op=dist.ReduceOp.MAX)
+        #     # T = int(T_tensor.item())
+        #     # control the maximum target length 
+        #     T = int(self.cfg.get("inference_tgt_len", 2 * T_tensor.item()))
+        #     if T > T_local:
 
-                last_frame_source = source_encoded[:, T_local - 1 : T_local, :]
-                pad_source = last_frame_source.repeat(1, T - T_local, 1)
-                source_encoded = torch.cat([source_encoded, pad_source], dim=1)
-                last_frame_asr = asr_emb[:, T_local - 1 : T_local, :]
-                pad_asr = last_frame_asr.repeat(1, T - T_local, 1)
-                asr_emb = torch.cat([asr_emb, pad_asr], dim=1)
-        else:
-            T = T_local
+        #         last_frame_source = source_encoded[:, T_local - 1 : T_local, :]
+        #         pad_source = last_frame_source.repeat(1, T - T_local, 1)
+        #         source_encoded = torch.cat([source_encoded, pad_source], dim=1)
+        #         last_frame_asr = asr_emb[:, T_local - 1 : T_local, :]
+        #         pad_asr = last_frame_asr.repeat(1, T - T_local, 1)
+        #         asr_emb = torch.cat([asr_emb, pad_asr], dim=1)
+        # else:
+        #     T = T_local
+        # 1. Default to local T
+        T_tensor = torch.tensor([T_local], device=source_encoded.device)
+
+        # 2. If FSDP is used, sync T across workers
+        if self._use_fsdp:
+            dist.all_reduce(T_tensor, op=dist.ReduceOp.MAX)
+
+        # 3. Allow user override: control max decoding steps (can also use 2x input length heuristic)
+        T_config = self.cfg.get("inference_tgt_len", 1.2 * T_tensor.item())
+        T = int(T_config)
+
+        # 4. Pad `source_encoded` and `asr_emb` if T > T_local
+        if T > T_local:
+            last_frame_source = source_encoded[:, T_local - 1 : T_local, :]
+            pad_source = last_frame_source.repeat(1, T - T_local, 1)
+            source_encoded = torch.cat([source_encoded, pad_source], dim=1)
+
+            last_frame_asr = asr_emb[:, T_local - 1 : T_local, :]
+            pad_asr = last_frame_asr.repeat(1, T - T_local, 1)
+            asr_emb = torch.cat([asr_emb, pad_asr], dim=1)
+        
 
         # Apply channel weight
         input_embeds = source_encoded.clone()
@@ -1101,6 +1124,10 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         gen_audio[:, 0] = ans["audio_logits"][:, -1].argmax(dim=-1)
 
         speech_state = torch.zeros(B, device=self.device, dtype=torch.long)
+        gen_audio_len = torch.full((B,), T, device=self.device, dtype=input_signal_lens.dtype)
+        gen_text_len = torch.full((B,), T, device=self.device, dtype=input_signal_lens.dtype)
+        audio_done = torch.zeros(B, dtype=torch.bool, device=self.device)
+        txt_done = torch.zeros(B, dtype=torch.bool, device=self.device)
         # Autoregressive loop
         for t in range(1, T):
             last_emb = self.embed_tokens(gen_text[:, t - 1])
@@ -1155,6 +1182,17 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                     self.speech_eos_id,
                     gen_audio[:, t],
                 )
+            # --- EOS tracking ---
+            speech_done = (gen_audio[:, t] == self.speech_eos_id).any(dim=1)
+            text_done = (gen_text[:, t] == self.text_eos_id)
+            newly_speech_done = (~audio_done) & (speech_done)
+            newly_text_done = (~txt_done) & (text_done)
+            gen_audio_len[newly_speech_done] = t + 1
+            gen_text_len[newly_text_done] = t + 1
+            audio_done |= newly_speech_done
+            txt_done |= newly_text_done
+            if audio_done.all() and txt_done.all():
+                break
 
         # Trim back to local length if padded
         if self._use_fsdp and T > T_local:
@@ -1167,8 +1205,9 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         #     "tokens_audio": gen_audio,
         #     "tokens_len": lengths,
         # }
+        # breakpoint()
         ans = {
-            "text": tokens_to_str(gen_text, dataset_batch["decode_source_audio_lens"], tokenizer=self.tokenizer, pad_id=self.text_pad_id),
+            "text": tokens_to_str(gen_text, gen_text_len, tokenizer=self.tokenizer, pad_id=self.text_pad_id),
             "tokens_text": gen_text,
             "tokens_audio": gen_audio,
             "tokens_len": dataset_batch["decode_source_audio_lens"],
@@ -1181,7 +1220,7 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
                 #     tokens=gen_audio_codes.transpose(1, 2), tokens_len=lengths
                 # )
                 predicted_audio, predicted_audio_lens = self.audio_codec.decode(
-                    tokens=gen_audio_codes.transpose(1, 2), tokens_len=dataset_batch["decode_source_audio_lens"]
+                    tokens=gen_audio_codes.transpose(1, 2), tokens_len=gen_audio_len
                 )
             ans["audio"] = predicted_audio
             ans["audio_len"] = predicted_audio_lens

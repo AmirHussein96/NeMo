@@ -282,7 +282,7 @@ class TransformerARSpeechDecoder(NeuralModule):
             # generate a random speaker embedding
             
             inference_speaker_embedding = torch.randn([1, 1, self.speaker_embedding_dim])
-            self.register_buffer("inference_speaker_embedding", inference_speaker_embedding)
+            self.register_buffer("inference_speaker_embedding", inference_speaker_embedding, persistent=False)
             # if inference_speaker_reference is provided, replace random embedding by the reference speaker embedding
             if self.inference_speaker_reference:
                 self.update_inference_speaker_embedding(self.inference_speaker_reference)
