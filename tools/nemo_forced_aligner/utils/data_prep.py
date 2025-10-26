@@ -912,7 +912,7 @@ def load_nemo_tarred_from_dir(manifest_path: str, tar_paths: str) -> CutSet:
     iterator = LazyNeMoTarredIterator(
         manifest_path=manifest_path,
         tar_paths=tar_paths,
-        allow_skipme=True,
+        allow_skipme=False,
         skip_missing_manifest_entries=True,
     )
     return CutSet.from_cuts(iterator)
