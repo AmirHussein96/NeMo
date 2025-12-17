@@ -106,13 +106,16 @@ class DuplexS2SDatasetConcatV(torch.utils.data.Dataset):
         source_audio, decode_source_audio_lens = collate_audio(cuts.resample(self.source_sample_rate))
         vals = [float(c.custom['src_duration'])*self.source_sample_rate for c in cuts]
         source_audio_lens = torch.tensor(vals, dtype=decode_source_audio_lens.dtype, device=decode_source_audio_lens.device)
-
-        target_audio, target_audio_lens = collate_audio(
-            cuts.resample(self.target_sample_rate), recording_field="target_audio"
-        )
+        if cuts[0].custom.get('target_audio') is not None:
+            target_audio, target_audio_lens = collate_audio(
+                cuts.resample(self.target_sample_rate), recording_field="target_audio"
+            )
+            
+        else:
+            target_audio, target_audio_lens = None, None
+            
         target_tokens, target_token_lens = collate_token_channel(
-            cuts, self.tokenizer, self.frame_length, roles=self.output_roles
-        )
+                                            cuts, self.tokenizer, self.frame_length, roles=self.output_roles)
         source_tokens, source_token_lens = collate_token_channel(
             cuts, self.tokenizer, self.frame_length, roles=self.input_roles
         )
@@ -121,7 +124,7 @@ class DuplexS2SDatasetConcatV(torch.utils.data.Dataset):
         #     cuts.resample(self.target_sample_rate), roles=self.output_roles, recording_field="target_audio"
         # )
         first_turn_audio, first_turn_audio_lens = collate_first_turn_audio_source(
-            cuts.resample(self.target_sample_rate), sampling_rate=self.target_sample_rate, roles=self.input_roles
+            cuts.resample(self.target_sample_rate), roles=self.input_roles
         )
 
         return {
@@ -162,7 +165,6 @@ def collate_first_turn_audio(
 
 def collate_first_turn_audio_source(
     cuts: CutSet,
-    sampling_rate: int,
     roles: set[str],
 ) -> tuple[torch.Tensor, torch.Tensor]:
     first_turn_audios = []
