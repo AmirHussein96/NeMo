@@ -17,7 +17,7 @@ import torch
 from lightning.pytorch import Trainer
 from omegaconf import OmegaConf
 
-from nemo.collections.speechlm2 import DataModule, DuplexS2SDatasetSrcSpk, DuplexS2SSpeechDecoderModel
+from nemo.collections.speechlm2 import DataModule, DuplexS2SDatasetConcatVCodec, DuplexS2SSpeechDecoderModel2Codec
 from nemo.core.config import hydra_runner
 from nemo.utils.exp_manager import exp_manager
 from nemo.utils.trainer_utils import resolve_trainer_cfg
@@ -36,8 +36,8 @@ def train(cfg):
     OmegaConf.save(cfg, log_dir / "exp_config.yaml")
 
     with trainer.init_module():
-        model = DuplexS2SSpeechDecoderModel(OmegaConf.to_container(cfg, resolve=True))
-    dataset = DuplexS2SDatasetSrcSpk(
+        model = DuplexS2SSpeechDecoderModel2Codec(OmegaConf.to_container(cfg, resolve=True))
+    dataset = DuplexS2SDatasetConcatVCodec(
         tokenizer=model.tokenizer,
         frame_length=cfg.data.frame_length,
         source_sample_rate=cfg.data.source_sample_rate,

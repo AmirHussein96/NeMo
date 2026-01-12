@@ -93,11 +93,13 @@ class ResultsLogger:
         for i in range(len(refs)):
             # save audio
             sample_id = samples_id[i][:150]  # make sure that sample id is not too big
-            out_audio_path = os.path.join(self.audio_save_path, f"{name}_{sample_id}.wav")
+            out_dir = os.path.join(self.audio_save_path, name)
+            os.makedirs(out_dir, exist_ok=True)
+            out_audio_path = os.path.join(out_dir, f"{sample_id}.wav")
             self.merge_and_save_audio(out_audio_path, pred_audio[i], pred_audio_sr, user_audio[i], user_audio_sr)
             # create a wav with eou prediction for debug purposes
             if eou_pred is not None:
-                out_audio_path_eou = os.path.join(self.audio_save_path, f"{name}_{sample_id}_eou.wav")
+                out_audio_path_eou = os.path.join(out_dir, f"{sample_id}_eou.wav")
                 repeat_factor = int(pred_audio_sr / fps)
                 eou_pred_wav = (
                     eou_pred[i].unsqueeze(0).unsqueeze(-1).repeat(1, 1, repeat_factor)

@@ -13,16 +13,14 @@
 # limitations under the License.
 from .datamodule import DataModule
 from .s2s_dataset import DuplexS2SDataset
-from .s2s_dataset_srcspk import DuplexS2SDatasetSrcSpk
 from .s2s_dataset_concat_v import DuplexS2SDatasetConcatV
-from .s2s_dataset_st2 import DuplexS2SDatasetST
 from .salm_dataset import SALMDataset
+from .s2s_dataset_concat_v_codec import DuplexS2SDatasetConcatVCodec
 
 __all__ = [
     'DataModule',
     'DuplexS2SDataset',
-    'DuplexS2SDatasetSrcSpk',
     'DuplexS2SDatasetConcatV',
     'SALMDataset',
-    'DuplexS2SDatasetST',
+    'DuplexS2SDatasetConcatVCodec',
 ]

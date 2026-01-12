@@ -15,9 +15,8 @@ import re
 
 import torch
 import torch.utils.data
-import torchaudio
 
-from lhotse import CutSet, MonoCut, Recording, Seconds, SupervisionSegment, compute_num_frames
+from lhotse import CutSet, Seconds, compute_num_frames
 from lhotse.cut import Cut
 from lhotse.dataset.collation import collate_audio, collate_vectors
 from lhotse.utils import ifnone

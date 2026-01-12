@@ -13,14 +13,14 @@
 # limitations under the License.
 from .duplex_s2s_model import DuplexS2SModel
 from .duplex_s2s_speech_decoder_model import DuplexS2SSpeechDecoderModel
-from .duplex_s2s_speech_decoder_st_model import DuplexS2SSpeechDecoderModelST
 from .duplex_s2s_speech_decoder_model2 import DuplexS2SSpeechDecoderModel2
+from .duplex_s2s_speech_decoder_model2_codec_encoder import DuplexS2SSpeechDecoderModel2Codec
 from .salm import SALM
 
 __all__ = [
     'DuplexS2SModel',
     'DuplexS2SSpeechDecoderModel',
-    'DuplexS2SSpeechDecoderModelST',
     'SALM',
     'DuplexS2SSpeechDecoderModel2',
+    'DuplexS2SSpeechDecoderModel2Codec',
 ]
