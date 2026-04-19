@@ -1,0 +1,28 @@
+# - type: group
+#   weight: 3
+#   tags:
+#     s2s_duplex: true
+#   input_cfg:
+#   - type: lhotse_shar
+#     shar_path: /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_concat_mfa_target_aligned_chunk1.5s/riva_asr_fr-FR_v2.1/bucket1
+#   - type: lhotse_shar
+#     shar_path: /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_concat_mfa_target_aligned_chunk1.5s/riva_asr_fr-FR_v2.1/bucket2
+#   - type: lhotse_shar
+#     shar_path: /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_concat_mfa_target_aligned_chunk1.5s/riva_asr_fr-FR_v2.1/bucket3
+#   - type: lhotse_shar
+#     shar_path: /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_concat_mfa_target_aligned_chunk1.5s/riva_asr_fr-FR_v2.1/bucket4
+# - type: group
+#   weight: 1.0
+#   tags:
+#     s2s_duplex: true
+#   input_cfg:
+#   - type: lhotse_shar
+#     shar_path: /lustre/fsw/portfolios/edgeai/users/amhussein/lhotse_data_concat_mfa_target_aligned_chunk1.5s/soundhound_v1.0fr-FR
+- type: group
+  weight: 1.0
+  tags:
+    s2s_duplex: true
+  input_cfg:
+  - type: lhotse_shar
+    shar_path: <path/to/your/lhotse_shar> # replace with your lhotse shar path for English data
+  
