@@ -1161,27 +1161,18 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             gen_text = gen_text[:, :T_local]
             gen_audio = gen_audio[:, :T_local]
 
-        # ans = {
-        #     "text": tokens_to_str(gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id),
-        #     "tokens_text": gen_text,
-        #     "tokens_audio": gen_audio,
-        #     "tokens_len": lengths,
-        # }
         ans = {
-            "text": tokens_to_str(gen_text, dataset_batch["decode_source_audio_lens"], tokenizer=self.tokenizer, pad_id=self.text_pad_id),
+            "text": tokens_to_str(gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id),
             "tokens_text": gen_text,
             "tokens_audio": gen_audio,
-            "tokens_len": dataset_batch["decode_source_audio_lens"],
+            "tokens_len": lengths,
         }
 
         if decode_audio:
             gen_audio_codes = replace_control_speech_codes(gen_audio, self._control_codes)
             with fp32_precision(), torch.no_grad():
-                # predicted_audio, predicted_audio_lens = self.audio_codec.decode(
-                #     tokens=gen_audio_codes.transpose(1, 2), tokens_len=lengths
-                # )
                 predicted_audio, predicted_audio_lens = self.audio_codec.decode(
-                    tokens=gen_audio_codes.transpose(1, 2), tokens_len=dataset_batch["decode_source_audio_lens"]
+                    tokens=gen_audio_codes.transpose(1, 2), tokens_len=lengths
                 )
             ans["audio"] = predicted_audio
             ans["audio_len"] = predicted_audio_lens

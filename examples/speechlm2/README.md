@@ -40,6 +40,31 @@ Before running the recipe, update the following paths:
 python NeMo/scripts/speech_recognition/estimate_buckets.py data/en.yaml --buckets 30 --min_duration 30 --max_duration 120
 ``` 
 
+### Convert raw data to Lhotse Shar format
+
+This section provides a small toy example showing how to convert raw data from the NeMo manifest format into Lhotse Shar format.
+
+1. Download the raw `{src|tgt}` data from `data_sample`:
+   `https://huggingface.co/AmirHussein/nemo_models/tree/main/data_sample` 
+2. Convert the raw data from the NVIDIA manifest format into Lhotse Shars:
+
+   ```bash
+    src_manifest=src/sharded_manifests/manifest_0.jsonl
+    src_tar=src/audio_0.tar
+    tgt_manifest=tgt/sharded_manifests/manifest_0.jsonl
+    tgt_tar=tgt/audio_0.tar
+
+    python NeMo/nemo/collections/speechlm2/data/combine_info_concat_v.py \
+        --src_tar $src_tar \
+        --tgt_tar $tgt_tar \
+        --src_manifest $src_manifest \
+        --tgt_manifest $tgt_manifest \
+        --output_dir output_shar_dir
+    ```
+3. Compare the generated shars with `https://huggingface.co/AmirHussein/nemo_models/tree/main/data_sample/debug`
+4. Set the train data path in `NeMo/examples/speechlm2/conf/data/en.yaml` to point to `outpur_shar_dir`
+5. Repeat the same process for the validation subset, then set `validation_ds` in  `NeMo/examples/speechlm2/conf/train/qwen_1b.yaml` to point to `validation_shar_dir`. 
+
 
 ### Launch the English Duplex experiment:
 

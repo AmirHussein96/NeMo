@@ -1,8 +1,8 @@
 model:
   pretrained_llm: Qwen/Qwen2.5-1.5B-Instruct
   # pretrained_llm: TinyLlama/TinyLlama_v1.1
-  pretrained_audio_codec: /lustre/fsw/portfolios/convai/users/ecasanova/Checkpoints/Low_Frame-rate_Speech_Codec++_nemo_last_checkpoint/ml-model-NanoCodec-13_codebooks_2016_codes_1.78kbps_12.5FPS_aug_grad_clip_skip_nan/checkpoints/Low_Frame-rate_Speech_Codec++.nemo
-  pretrained_asr: /lustre/fsw/portfolios/edgeai/users/amhussein/pretrained_models/asr/mml-en-fr-es-de/en-fr-es-de.nemo
+  pretrained_audio_codec: 
+  pretrained_asr: 
   scoring_asr: stt_en_fastconformer_transducer_large
 
   pretrained_weights: true
@@ -95,7 +95,6 @@ model:
     cond_on_char_embedding: True
     cond_on_llm_latent: False
     use_speaker_encoder: true
-    #inference_speaker_reference: "/lustre/fsw/portfolios/convai/users/ecasanova/S2S-Duplex-new-codebase/inference_references/Emma_S3_A1_SC7_singleturntarget_21_channel_1_audio_in.wav"
 
 
   optimizer:
@@ -150,7 +149,7 @@ data:
     sampler_weights:
       cv_en: 1.0
     cv_en:
-      input_cfg: /export/fs06/ahussei6/nvidia/github/NeMo/examples/speechlm2/conf/data/data_en.yaml
+      input_cfg: /export/fs06/ahussei6/nvidia/github/NeMo/examples/speechlm2/conf/data/en.yaml
       bucket_buffer_size: 10000
       shuffle_buffer_size: 10000
       num_workers: 8
@@ -167,7 +166,7 @@ data:
   validation_ds:
     datasets:
       en_dev:
-         shar_path: <path/to/validation/dataset/shard> # replace with your validation dataset shard path
+         shar_path: /export/fs06/ahussei6/nvidia/github/debug # replace with your validation dataset shard path
         
     sample_rate: ${data.target_sample_rate}
     batch_size: 64  #4
@@ -189,7 +188,7 @@ exp_manager:
    resume_ignore_no_checkpoint: true
 
    # You may use this section to create a W&B logger
-   create_wandb_logger: true
+   create_wandb_logger: false
    wandb_logger_kwargs:
      name: development-run
      project: salm_s2s_speech_decoder_v2_char_tokens

@@ -13,26 +13,24 @@
 
 set -x
 
-# SEED=42
-SEED=$((SLURM_JOB_ID % 2147483647))
+SEED=42
+# SEED=$((SLURM_JOB_ID % 2147483647))
 
-WANDB="${WANDB_API_KEY}" # replace with your own WandB API key
-CODE_DIR=path/to/NeMo
+CODE_DIR=/export/fs06/ahussei6/nvidia/github/NeMo
 
 CONFIG_PATH=conf/train
 CONFIG_NAME="qwen_1b"
 
-EXP_NAME="${CONFIG_NAME}_${SLURM_JOB_NUM_NODES}" # source speaker
-RESULTS_DIR="<path to results dir>/${EXP_NAME}"
+EXP_NAME="${CONFIG_NAME}" 
+RESULTS_DIR="/export/fs06/ahussei6/nvidia/ara_duplex_test/${EXP_NAME}"
 mkdir -p ${RESULTS_DIR}
 
-PROJECT_NAME="duplex_s2s_st_exp_concat_v_mfa" # source speaker
+PROJECT_NAME="duplex_s2s_st" 
 
-pretrained_asr="<path/to/pretrained_asr.nemo>" # replace with your pretrained ASR model path
-pretrained_tts="<path/to/pretrained_tts.ckpt>" # replace with your pretrained TTS model path
-pretrained_codec="<path/to/pretrained_codec.nemo>" # replace with your pretrained codec model path
-export WANDB_API_KEY="${WANDB}" 
-export WANDB_ENTITY="<wandb_entity>" # replace with your WandB entity/org
+pretrained_asr="/export/fs06/ahussei6/nvidia/pretrained_models/asr/stt_en_fastconformer_hybrid_large_streaming_multi_v1.20.0/stt_en_fastconformer_hybrid_large_streaming_multi.nemo" # replace with your pretrained ASR model path
+pretrained_tts="/export/fs06/ahussei6/nvidia/pretrained_models/magpie_tts/tts-pretraining_qwnen_2.5_81007_steps.ckpt" # replace with your pretrained TTS model path
+pretrained_codec="/export/fs06/ahussei6/nvidia/pretrained_models/nano_codec/Low_Frame-rate_Speech_Codec++.nemo" # replace with your pretrained codec model path
+
 conda activate nemo 
 echo "Using Python at: $(which python)"
 echo "Config path: $CONFIG_PATH"
@@ -40,24 +38,19 @@ echo "Config name: $CONFIG_NAME"
 
 chmod -R 777 "${RESULTS_DIR}"
 export PYTHONPATH="${CODE_DIR}:${PYTHONPATH}"
-export HF_HOME="<path/to/cache/HFCACHE>"
-export TORCH_HOME="<path/to/cache/HFCACHE>"
-export NEMO_CACHE_DIR="<path/to/cache/HFCACHE>"
+export HF_HOME="/export/fs06/ahussei6/nvidia/cache/HFCACHE"
+export TORCH_HOME="/export/fs06/ahussei6/nvidia/cache/HFCACHE"
+export NEMO_CACHE_DIR="/export/fs06/ahussei6/nvidia/cache/HFCACHE"
 export OMP_NUM_THREADS=1
 export TOKENIZERS_PARALLELISM=false
 export LHOTSE_AUDIO_DURATION_MISMATCH_TOLERANCE=0.3
 
 HYDRA_FULL_ERROR=1 TORCH_CUDNN_V8_API_ENABLED=1 \
-python ${CODE_DIR}/examples/speechlm2/s2s_duplex_speech_decoder.py \
+python ${CODE_DIR}/examples/speechlm2/s2s_duplex_speech_decoder_train.py \
     --config-path=$CONFIG_PATH \
     --config-name=$CONFIG_NAME \
     ++exp_manager.checkpoint_callback_params.save_top_k=3 \
     exp_manager.name=${EXP_NAME} \
-    exp_manager.wandb_logger_kwargs.name=${EXP_NAME} \
-    ++exp_manager.create_wandb_logger=true \
-    ++exp_manager.wandb_logger_kwargs.project=${PROJECT_NAME} \
-    ++exp_manager.wandb_logger_kwargs.entity=${WANDB_ENTITY} \
-    ++exp_manager.wandb_logger_kwargs.resume=true \
     ++model.pretrained_audio_codec="${pretrained_codec}" \
     ++model.pretrained_tts_from_s2s="${pretrained_tts}" \
     ++model.pretrained_asr="${pretrained_asr}" \
@@ -82,7 +75,7 @@ python ${CODE_DIR}/examples/speechlm2/s2s_duplex_speech_decoder.py \
     ++model.custom_speech_delay_id=2018 \
     model.perception.encoder.att_context_size=[70,0] \
     model.perception.modality_adapter.att_context_size=[70,0] \
-    ++model.pretrained_llm="/lustre/fsw/portfolios/edgeai/users/amhussein/cache/HFCACHE/hub/models--Qwen--Qwen2.5-1.5B-Instruct/snapshots/989aa7980e4cf806f80c7fef2b1adb7bc71aa306" \
+    ++model.pretrained_llm="/export/fs06/ahussei6/nvidia/cache/HFCACHE/hub/models--Qwen--Qwen2.5-1.5B-Instruct/snapshots/989aa7980e4cf806f80c7fef2b1adb7bc71aa306" \
     ++trainer.limit_val_batches=1 \
     ++trainer.val_check_interval=1000 \
     ++model.scale_loss_by="non_sil_t" \
