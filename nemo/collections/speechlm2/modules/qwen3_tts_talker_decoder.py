@@ -61,22 +61,6 @@ class Qwen3TTSTalkerSpeechDecoder(nn.Module):
     * **Classifier-Free Guidance (CFG)**: optionally drops the full condition
       vector with probability ``cfg_unconditional_prob`` during training; at
       inference scales logits by ``cfg_scale``.
-
-    Parameters
-    ----------
-    model_path_or_name:
-        Path to ``Qwen3-TTS-12Hz-0.6B-Base-hf`` (or HF hub ID).
-    speech_decoder_parms:
-        ``cfg.model.speech_decoder`` dict.  Keys consumed here are popped so
-        the remainder is not silently ignored.
-    lantent_dim:
-        LLM hidden size (used for optional LLM-latent conditioning).
-    num_audio_codebooks:
-        Must match ``talker.config.num_code_groups`` (16 for 0.6B).
-    speech_vocab_size:
-        Effective vocab size seen by the duplex model (e.g. 3072).
-    raw_codec_vocab_size:
-        Number of raw audio codes below the special-token range (2048).
     """
 
     def __init__(
@@ -100,7 +84,6 @@ class Qwen3TTSTalkerSpeechDecoder(nn.Module):
         self.num_audio_tokens_per_codebook = int(speech_vocab_size)
         self.raw_codec_vocab_size = int(raw_codec_vocab_size)
 
-        # Pop all known keys so stray keys are caught early.
         self.cfg_unconditional_prob = self.speech_decoder_parms.pop("cfg_unconditional_prob", None)
         self.cfg_scale = self.speech_decoder_parms.pop("cfg_scale", 2.5)
         self.cond_on_prev_audio_tokens = self.speech_decoder_parms.pop("cond_on_prev_audio_tokens", True)
@@ -118,6 +101,9 @@ class Qwen3TTSTalkerSpeechDecoder(nn.Module):
         self.inference_speaker_reference = self.speech_decoder_parms.pop("inference_speaker_reference", None)
         self.max_speaker_reference_len = self.speech_decoder_parms.pop("max_speaker_reference_len", 5)
         self.speaker_encoder_model_name = self.speech_decoder_parms.pop("speaker_encoder_model_name", "titanet_large")
+        # "qwen3" uses the ECAPA-TDNN from the Qwen3-TTS checkpoint (1024-dim, 24 kHz).
+        # "titanet" uses NeMo's TitaNet via EncDecSpeakerLabelModel.from_pretrained().
+        self.speaker_encoder_type = self.speech_decoder_parms.pop("speaker_encoder_type", "qwen3")
         self.cond_on_char_embedding = self.speech_decoder_parms.pop("cond_on_char_embedding", True)
         self.use_random_spk_emb = False
 
@@ -134,7 +120,6 @@ class Qwen3TTSTalkerSpeechDecoder(nn.Module):
         )
         qwen_model = qwen.model
 
-        # Talker (main transformer + sub-codebook predictor)
         self.talker = qwen_model.talker
         self.talker_config = self.talker.config
         self.talker_hidden_size = int(self.talker_config.hidden_size)
@@ -153,7 +138,7 @@ class Qwen3TTSTalkerSpeechDecoder(nn.Module):
             )
 
         # Save the ECAPA-TDNN speaker encoder before releasing the wrapper.
-        # It lives at qwen.model.speaker_encoder (Qwen3TTSSpeakerEncoder, 1024-dim, 24 kHz).
+        # Lives at qwen.model.speaker_encoder (Qwen3TTSSpeakerEncoder, 1024-dim, 24 kHz).
         self._qwen_speaker_encoder = qwen_model.speaker_encoder
         self._qwen_speaker_encoder_sr = int(getattr(qwen_model, "speaker_encoder_sample_rate", 24000))
 
@@ -179,8 +164,6 @@ class Qwen3TTSTalkerSpeechDecoder(nn.Module):
 
         # ------------------------------------------------------------------
         # Speaker encoder setup.
-        # setup_speaker_encoder() sets self.speaker_encoder and
-        # overwrites self.speaker_embedding_dim to the actual output dim.
         # ------------------------------------------------------------------
         self.speaker_encoder = None
         self.speaker_encoder_emb_projection = None
@@ -199,10 +182,6 @@ class Qwen3TTSTalkerSpeechDecoder(nn.Module):
             persistent=False,
         )
 
-    # ------------------------------------------------------------------
-    # Properties
-    # ------------------------------------------------------------------
-
     @property
     def device(self) -> torch.device:
         return next(self.parameters()).device
@@ -212,26 +191,55 @@ class Qwen3TTSTalkerSpeechDecoder(nn.Module):
     # ------------------------------------------------------------------
 
     def setup_speaker_encoder(self):
-        """Install (or re-freeze) the Qwen3 ECAPA-TDNN speaker encoder.
+        """Install the speaker encoder (called once from ``__init__``).
 
-        Called once from ``__init__`` and again from ``on_train_epoch_start``
-        (via the outer model) to ensure the encoder stays frozen.  After the
-        first call the encoder is registered as ``self.speaker_encoder`` and
-        subsequent calls just re-apply ``eval()`` + freeze.
+        ``on_train_epoch_start`` must NOT call this; it only does a lightweight
+        ``.float().eval()`` guard directly on ``self.speaker_encoder``.
+
+        ``speaker_encoder_type`` selects the backend:
+          * ``"qwen3"``   – Qwen3-TTS ECAPA-TDNN (1024-dim, 24 kHz); default.
+          * ``"titanet"`` – NeMo TitaNet loaded via ``EncDecSpeakerLabelModel.from_pretrained()``.
         """
+        if self.speaker_encoder_type == "titanet":
+            self._setup_titanet_speaker_encoder()
+            # Remove the Qwen3 ECAPA-TDNN submodule – it is unused when TitaNet is active.
+            # Leaving it registered causes DDP to broadcast its ~16.9 M parameters on
+            # every forward pass, which desynchronises ranks over Lustre and triggers
+            # NCCL BROADCAST timeouts within the first ~72 training steps.
+            if hasattr(self, "_qwen_speaker_encoder"):
+                del self._qwen_speaker_encoder
+        else:
+            self._setup_qwen3_speaker_encoder()
+
+    def _setup_qwen3_speaker_encoder(self):
         if self.speaker_encoder is None:
-            # First call from __init__: install the Qwen3 ECAPA-TDNN.
-            self.speaker_encoder = self._qwen_speaker_encoder  # Qwen3TTSSpeakerEncoder
-            # Determine output dimension from the final FC layer.
+            # First call: promote the ECAPA-TDNN to self.speaker_encoder and
+            # drop the duplicate submodule reference so DDP only sees one copy.
+            self.speaker_encoder = self._qwen_speaker_encoder
             fc = self._qwen_speaker_encoder.fc
             self.speaker_embedding_dim = (
                 fc.out_channels if hasattr(fc, "out_channels") else fc.out_features
             )  # 1024 for 0.6B-Base
-
-        # Always ensure frozen + eval (safe to call repeatedly).
-        self.speaker_encoder.eval()
+            del self._qwen_speaker_encoder  # avoid double-registration in DDP
+        # Always ensure frozen fp32 eval.
+        self.speaker_encoder.float().eval()
         for p in self.speaker_encoder.parameters():
             p.requires_grad = False
+
+    def _setup_titanet_speaker_encoder(self):
+        from nemo.collections.asr.models import EncDecSpeakerLabelModel
+        from nemo.collections.speechlm2.parts.precision import fp32_precision
+
+        with fp32_precision():
+            self.speaker_encoder = EncDecSpeakerLabelModel.from_pretrained(
+                model_name=self.speaker_encoder_model_name
+            )
+        self.speaker_encoder.eval()
+        self.speaker_encoder.freeze()
+        for p in self.speaker_encoder.parameters():
+            p.requires_grad = False
+        # speaker_embedding_dim stays at the config value (default 192 for titanet_large/small).
+        # Do NOT overwrite here — speaker_encoder_emb_projection is already built with that dim.
 
     def update_inference_speaker_embedding(self, audio_path: str):
         audio, sr = torchaudio.load(audio_path)
@@ -244,21 +252,26 @@ class Qwen3TTSTalkerSpeechDecoder(nn.Module):
         self.inference_speaker_embedding = embedding
 
     def get_speaker_embedding(self, audio: torch.Tensor, audio_len: torch.Tensor, sr: int) -> torch.Tensor:
-        """Extract a 1024-dim x-vector using Qwen3's ECAPA-TDNN.
+        """Extract a speaker embedding using the configured speaker encoder.
 
         Args:
             audio:     ``(B, S)`` float waveform at sample rate ``sr``.
-            audio_len: ``(B,)`` lengths in samples (used to trim to reference).
+            audio_len: ``(B,)`` lengths in samples.
             sr:        Sample rate of ``audio``.
 
         Returns:
-            ``(B, 1, 1024)`` speaker embedding, cast to ``inference_speaker_embedding`` dtype.
+            ``(B, 1, D)`` speaker embedding cast to ``inference_speaker_embedding`` dtype,
+            where D=1024 for Qwen3 ECAPA-TDNN and D=speaker_embedding_dim for TitaNet.
         """
+        if self.speaker_encoder_type == "titanet":
+            return self._get_titanet_speaker_embedding(audio, audio_len, sr)
+        return self._get_qwen3_speaker_embedding(audio, audio_len, sr)
+
+    def _get_qwen3_speaker_embedding(self, audio: torch.Tensor, audio_len: torch.Tensor, sr: int) -> torch.Tensor:
         from qwen_tts.core.models.modeling_qwen3_tts import mel_spectrogram
 
         audio = audio[:, : int(self.max_speaker_reference_len * sr)]
         with torch.no_grad():
-            # Resample to the ECAPA-TDNN's expected 24 kHz.
             audio_24k = torchaudio.functional.resample(
                 audio.float(), sr, self._qwen_speaker_encoder_sr
             )
@@ -273,12 +286,33 @@ class Qwen3TTSTalkerSpeechDecoder(nn.Module):
                 fmax=12000,
             ).transpose(1, 2)  # (B, T_mel, 128)
 
+            spk_enc_dtype = next(self.speaker_encoder.parameters()).dtype
             speaker_emb = self.speaker_encoder(
-                mels.to(self.device).to(torch.float32)
+                mels.to(self.device).to(spk_enc_dtype)
             )  # (B, 1024)
             speaker_emb = speaker_emb.unsqueeze(1)  # (B, 1, 1024)
 
         return speaker_emb.to(self.inference_speaker_embedding.dtype)
+
+    def _get_titanet_speaker_embedding(self, audio: torch.Tensor, audio_len: torch.Tensor, sr: int) -> torch.Tensor:
+        """Extract speaker embedding with NeMo TitaNet.
+
+        Matches the old-recipe implementation in TransformerARSpeechDecoder exactly:
+        fp32 autocast, reads model SR from config, calls speaker_encoder.forward().
+        """
+        audio = audio[:, : int(self.max_speaker_reference_len * sr)]
+        with torch.autocast(device_type="cuda", dtype=torch.float32):
+            with torch.no_grad():
+                model_sr = self.speaker_encoder._cfg.train_ds.get("sample_rate", 16000)
+                audio_resampled = torchaudio.functional.resample(audio, sr, model_sr)
+                audio_len_resampled = audio_len * (model_sr / sr)
+                _, g = self.speaker_encoder(
+                    input_signal=audio_resampled.to(self.device),
+                    input_signal_length=audio_len_resampled.long().to(self.device),
+                )  # (B, D)
+                g = g.unsqueeze(1)  # (B, 1, D)
+
+        return g.to(self.inference_speaker_embedding.dtype)
 
     # ------------------------------------------------------------------
     # Cache helpers
@@ -313,7 +347,7 @@ class Qwen3TTSTalkerSpeechDecoder(nn.Module):
         return self.cache[name]
 
     # ------------------------------------------------------------------
-    # Token sanitisation helpers
+    # Token sanitisation
     # ------------------------------------------------------------------
 
     def _sanitize_first_codebook(self, tokens: torch.Tensor) -> torch.Tensor:
@@ -335,7 +369,6 @@ class Qwen3TTSTalkerSpeechDecoder(nn.Module):
     # ------------------------------------------------------------------
 
     def _embed_audio_tokens_btk(self, audio_tokens: torch.Tensor) -> torch.Tensor:
-        """Sum embeddings across codebooks: ``(B, T, K) → (B, T, H)``."""
         first = self._sanitize_first_codebook(audio_tokens[:, :, 0])
         audio_emb = self.talker.get_input_embeddings()(first)
         sub_embeddings = self.talker.code_predictor.get_input_embeddings()
@@ -362,7 +395,6 @@ class Qwen3TTSTalkerSpeechDecoder(nn.Module):
     def _sub_logits_teacher_forced(
         self, hidden_states: torch.Tensor, target_audio_tokens: torch.Tensor
     ) -> torch.Tensor:
-        """Return sub-codebook logits ``(B, T, K-1, V)`` using teacher forcing."""
         bsz, steps, hidden = hidden_states.shape
         flat_hidden = hidden_states.reshape(bsz * steps, hidden)
         flat_codes = target_audio_tokens.reshape(bsz * steps, self.num_audio_codebooks)
@@ -382,7 +414,6 @@ class Qwen3TTSTalkerSpeechDecoder(nn.Module):
     def _sub_logits_greedy(
         self, hidden_states: torch.Tensor, first_code_ids: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Greedy sub-codebook decoding for inference (single frame)."""
         bsz, hidden = hidden_states.shape
         first_code_ids = self._sanitize_first_codebook(first_code_ids)
         embeds = [
@@ -471,7 +502,7 @@ class Qwen3TTSTalkerSpeechDecoder(nn.Module):
                 projected_asr = torch.zeros_like(projected_asr)
             condition = condition + projected_asr
 
-        # ---- Additive speaker conditioning ----
+        # ---- Additive speaker conditioning (ECAPA-TDNN, 1024-dim) ----
         if self.use_speaker_encoder:
             if self.use_input_cache and not self.training:
                 speaker_encoder_emb = self.inference_speaker_embedding
@@ -519,7 +550,6 @@ class Qwen3TTSTalkerSpeechDecoder(nn.Module):
         talker_hidden = outputs.last_hidden_state
         first_logits = self._pad_logits(self.talker.codec_head(talker_hidden), self.num_audio_tokens_per_codebook)
 
-        # Apply CFG to first-codebook logits
         if use_cfg_inference:
             batch_size = first_logits.size(0) // 2
             cond_first = first_logits[:batch_size]
@@ -528,7 +558,6 @@ class Qwen3TTSTalkerSpeechDecoder(nn.Module):
 
         # ---- Sub-codebook prediction ----
         if target_audio_tokens is not None:
-            # Training: teacher-forced sub-codebook prediction.
             if use_cfg_inference:
                 talker_hidden = talker_hidden[:batch_size]
             sub_logits = self._sub_logits_teacher_forced(talker_hidden, target_audio_tokens)
@@ -537,7 +566,6 @@ class Qwen3TTSTalkerSpeechDecoder(nn.Module):
             sampled_audio_tokens = None
 
         elif self.use_input_cache and not self.training:
-            # Inference: greedy per-frame sub-codebook decoding.
             first_last = first_logits[:, -1, :]
             first_pred = torch.argmax(first_last, dim=-1)
             if use_cfg_inference:
@@ -554,7 +582,6 @@ class Qwen3TTSTalkerSpeechDecoder(nn.Module):
             sampled_audio_tokens = [generated[:, i : i + 1] for i in range(generated.size(1))]
 
         else:
-            # Fallback: pseudo-teacher-forced using input tokens.
             if use_cfg_inference:
                 talker_hidden = talker_hidden[:batch_size]
             sub_logits = self._sub_logits_teacher_forced(talker_hidden, input_audio_tokens)

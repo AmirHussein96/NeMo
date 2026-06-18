@@ -15,6 +15,10 @@ from .duplex_s2s_model import DuplexS2SModel
 from .duplex_s2s_speech_decoder_model import DuplexS2SSpeechDecoderModel
 from .duplex_s2s_speech_decoder_model2 import DuplexS2SSpeechDecoderModel2
 from .duplex_s2s_speech_decoder_model2_codec_encoder import DuplexS2SSpeechDecoderModel2Codec
+from .duplex_s2s_speech_decoder_model_qwen3 import (
+    Qwen3CodecDuplexS2SSpeechDecoderModel,
+    setup_qwen3_audio_codec,
+)
 from .salm import SALM
 
 __all__ = [
@@ -23,4 +27,6 @@ __all__ = [
     'SALM',
     'DuplexS2SSpeechDecoderModel2',
     'DuplexS2SSpeechDecoderModel2Codec',
+    'Qwen3CodecDuplexS2SSpeechDecoderModel',
+    'setup_qwen3_audio_codec',
 ]

@@ -130,10 +130,10 @@ class DuplexS2SDatasetConcatV(torch.utils.data.Dataset):
             "sample_id": [str(cut.id) for cut in cuts],
             "source_audio": source_audio,
             "source_audio_lens": source_audio_lens,
-            "decode_source_audio_lens": decode_source_audio_lens,
             "target_audio": target_audio,
             "target_audio_lens": target_audio_lens,
             "target_tokens": target_tokens,
+            "decode_source_audio_lens": decode_source_audio_lens,
             "target_token_lens": target_token_lens,
             "source_tokens": source_tokens,
             "source_token_lens": source_token_lens,
@@ -251,14 +251,13 @@ def build_token_channel(
 
             # if eospos < len(tokens):
             #     tokens[eospos] = tokenizer.eos
-    # TODO: add speech eos at the end of the sequence and use text eos at the end of the tokens
-    # if endpos < len(tokens):
-    #     tokens[endpos] = tokenizer.eos
-    # else:
-    if eospos < len(tokens):
-        tokens[eospos] = tokenizer.eos
-    else:
-        tokens[-1] = tokenizer.eos
+    # eospos = compute_num_frames(supervision.end, ...) gives the *count* of complete frames
+    # up to the end of the last agent supervision, so valid frame indices are 0..eospos-1.
+    # Placing EOS at eospos (one-past-end) would put it exactly at the truncation boundary
+    # in the training step (target_tokens is cut to target_codes.shape[1] == eospos frames),
+    # so it would never appear in training labels.  Use eospos-1 (the last valid frame).
+    eos_frame = min(max(eospos - 1, 0), len(tokens) - 1)
+    tokens[eos_frame] = tokenizer.eos
     return tokens
 
 def _strip_timestamps(

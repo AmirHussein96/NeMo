@@ -269,6 +269,7 @@ class TransformerARSpeechDecoder(NeuralModule):
         self.cas_n_layers = self.speech_decoder_parms.pop("cas_n_layers", 1)
         self.use_cas_cache = self.speech_decoder_parms.pop("use_cas_cache", True)
         self.use_gated_fusion = self.speech_decoder_parms.pop("use_gated_fusion", False)
+        self.cond_on_source_audio_tokens = self.speech_decoder_parms.pop("cond_on_source_audio_tokens", False)
 
         if self.use_speaker_encoder:
             # load speaker encoder
@@ -349,6 +350,10 @@ class TransformerARSpeechDecoder(NeuralModule):
         if self.cond_on_asr_emb:
             self.asr_emb_projection = nn.Linear(self.asr_emb_dim, self.speech_decoder_parms["d_model"])
 
+        if self.cond_on_source_audio_tokens:
+            if self.use_gated_fusion:
+                self.source_audio_tokens_gate_proj = nn.Linear(2 * self.speech_decoder_parms["d_model"], 1)
+
     def setup_speaker_encoder(self):
         with fp32_precision():
             self.speaker_encoder = EncDecSpeakerLabelModel.from_pretrained(model_name=self.speaker_encoder_model_name)
@@ -385,7 +390,7 @@ class TransformerARSpeechDecoder(NeuralModule):
         return g.to(self.inference_speaker_embedding.dtype)
 
 
-    def forward(self, hidden_states, speech_mask, input_audio_tokens=None, target_text_tokens=None, modality_adapter_emb=None, asr_emb=None, speaker_encoder_emb=None, temperature=0.7, topk=80, greedy=True):
+    def forward(self, hidden_states, speech_mask, input_audio_tokens=None, target_text_tokens=None, modality_adapter_emb=None, asr_emb=None, speaker_encoder_emb=None, source_audio_tokens=None, temperature=0.7, topk=80, greedy=True):
         # LLM returns T, B, F so reshape it
         if hidden_states is not None:
             hidden_states = hidden_states.transpose(0, 1).contiguous() # .reshape(B, T, F) # from [T, B, F] to [B, T, F]
@@ -419,6 +424,13 @@ class TransformerARSpeechDecoder(NeuralModule):
                 if target_text_tokens is not None:
                     self.cache["target_text_tokens"] = torch.cat([self.cache["target_text_tokens"], target_text_tokens], dim=1)
                     target_text_tokens = self.cache["target_text_tokens"]
+
+            if self.cache["source_audio_tokens"] is None:
+                self.cache["source_audio_tokens"] = source_audio_tokens
+            else:
+                if source_audio_tokens is not None:
+                    self.cache["source_audio_tokens"] = torch.cat([self.cache["source_audio_tokens"], source_audio_tokens], dim=1)
+                    source_audio_tokens = self.cache["source_audio_tokens"]
 
         # map hidden states to the shape of the
         if hidden_states is not None and self.input_proj is not None:
@@ -562,6 +574,8 @@ class TransformerARSpeechDecoder(NeuralModule):
                 # if cond on prev tokens enabled, so duplicate the tokens to the new shape
                 if self.cond_on_prev_audio_tokens:
                     input_audio_tokens = torch.cat([input_audio_tokens, input_audio_tokens], dim=0)
+                if self.cond_on_source_audio_tokens and source_audio_tokens is not None:
+                    source_audio_tokens = torch.cat([source_audio_tokens, source_audio_tokens], dim=0)
 
         # audio tokens should not be dropped by cfg, so we keep it here
         if self.cond_on_prev_audio_tokens:
@@ -578,7 +592,19 @@ class TransformerARSpeechDecoder(NeuralModule):
             else:
                 
                 speech_decoder_input = speech_decoder_input + audio_tokens_embedded
-        
+        if self.cond_on_source_audio_tokens:
+            if self.detach_input:
+                source_audio_tokens = source_audio_tokens.detach()
+            source_audio_tokens_embedded = self.embed_audio_tokens(
+                source_audio_tokens.transpose(1, 2).contiguous()
+            )  # (B, T', E)
+            if self.use_gated_fusion:
+                gate_input = torch.cat([speech_decoder_input, source_audio_tokens_embedded], dim=-1)
+                gate = torch.sigmoid(self.source_audio_tokens_gate_proj(gate_input))
+                speech_decoder_input = gate * speech_decoder_input + (1 - gate) * source_audio_tokens_embedded
+            else:
+                speech_decoder_input = speech_decoder_input + source_audio_tokens_embedded
+
         decoder_out = self.t5_decoder(x=speech_decoder_input, x_mask=speech_mask)['output']
 
         # if it is true we need to return just the last autoregressive step, it is valid because for 1 frame input we produce 1 frame ouput
@@ -653,4 +679,5 @@ class TransformerARSpeechDecoder(NeuralModule):
             'modality_adapter_emb': None,
             'asr_emb': None,
             'char_embs': None,
+            'source_audio_tokens': None,
         }

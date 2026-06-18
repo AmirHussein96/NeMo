@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from .perception import AudioPerceptionModule
+from .qwen3_tts_talker_decoder import Qwen3TTSTalkerSpeechDecoder
+from .qwen3_tts_codec_adapter import Qwen3TTSCodecAdapter
 from .speech_generation import TransformerARSpeechDecoder, EOUDecoder, EOUDecoderFromWav
 
 __all__ = [
@@ -19,4 +21,6 @@ __all__ = [
     'TransformerARSpeechDecoder',
     'EOUDecoder',
     'EOUDecoderFromWav',
+    'Qwen3TTSTalkerSpeechDecoder',
+    'Qwen3TTSCodecAdapter',
 ]

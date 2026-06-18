@@ -320,6 +320,7 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
         modality_adapter_emb=None,
         asr_emb=None,
         speaker_encoder_emb=None,
+        source_audio_tokens=None,
     ) -> dict[str, Tensor]:
         """
         Separated text and speech prediction:
@@ -379,6 +380,7 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
             modality_adapter_emb=modality_adapter_emb,
             asr_emb=asr_emb,
             speaker_encoder_emb=speaker_encoder_emb,
+            source_audio_tokens=source_audio_tokens,
         )
 
         audio_logits = audio_logits.view(B, T, self._num_codebooks, self.speech_vocab_size)
@@ -604,16 +606,30 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
             )
         target_codes = target_codes.transpose(1, 2)  # (B, K, T) -> (B, T, K)
 
+        # extract source codec latent (pre-quantization) for speech decoder conditioning
+        source_audio_tokens = None
+        if self.speech_generation.cond_on_source_audio_tokens:
+            source_audio_22k = resample(batch["source_audio"], self.source_sample_rate, self.target_sample_rate)
+            source_audio_22k_lens = (batch["source_audio_lens"].float() * self.target_sample_rate / self.source_sample_rate).long()
+            with fp32_precision(), torch.no_grad():
+                src_tokens, src_codes_lens = self.audio_codec.encode(audio=source_audio_22k, audio_len=source_audio_22k_lens)
+            source_audio_tokens = src_tokens.transpose(1, 2)  # (B, D, T) -> (B, T, D)
+
         if (tl := target_codes.shape[1]) != (sl := source_encoded.shape[1]):
             if tl < sl:
                 diff = sl - tl
                 source_encoded = source_encoded[:, :tl]
                 asr_emb = asr_emb[:, :tl]
                 target_tokens = target_tokens[:, :tl]
+                if source_audio_tokens is not None:
+                    source_audio_tokens = source_audio_tokens[:, :tl]
                 torch.clamp_(source_encoded_lens, max=tl)
             else:
                 diff = tl - sl
                 target_codes = target_codes[:, :sl]
+                if source_audio_tokens is not None:
+                    source_audio_tokens = source_audio_tokens[:, :sl]
+                    torch.clamp_(src_codes_lens, max=sl)
                 torch.clamp_(target_codes_lens, max=sl)
             if diff > 2:
                 logging.warning(
@@ -665,6 +681,9 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
         text_labels = input_ids[:, 1:, -1]  # (B, T-1)
         audio_inputs = input_ids[:, :-1, :-1]  # (B, T-1, K)
         audio_labels = input_ids[:, 1:, :-1]  # (B, T-1, K)
+
+        if source_audio_tokens is not None:
+            source_audio_tokens = source_audio_tokens[:, :-1]
 
         input_embeds = self.embed_tokens(text_inputs)
 
@@ -829,6 +848,7 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
             "perception_emb": source_encoded[:, :-1],
             "asr_emb": asr_emb[:, :-1],
             "speaker_encoder_emb": speaker_encoder_emb,
+            "source_audio_tokens": source_audio_tokens,
         }
 
 
@@ -845,6 +865,7 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
             modality_adapter_emb=inputs["perception_emb"],
             asr_emb=inputs["asr_emb"],
             speaker_encoder_emb=inputs["speaker_encoder_emb"],
+            source_audio_tokens=inputs["source_audio_tokens"],
         )
         num_frames = inputs["input_lens"].sum()
         with loss_parallel():
@@ -955,6 +976,7 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
         for name, dataset_batch in batch.items():
             if dataset_batch is None:
                 continue  # some dataset is exhausted
+            speaker_encoder_emb = None
             if self.speech_generation.use_speaker_encoder and not self.use_random_spk_emb:
                     first_turn_audio = dataset_batch["first_turn_audio"]
                     first_turn_audio_lens = dataset_batch["first_turn_audio_lens"]
@@ -965,7 +987,6 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
                     self.speech_generation.update_inference_speaker_embedding_from_embedding(
                         speaker_encoder_emb
                     )
-            
 
             results = self.offline_inference(dataset_batch, speaker_encoder_emb=speaker_encoder_emb)
 
@@ -1052,6 +1073,18 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
         )
         B, T_local, H = source_encoded.shape
 
+        # extract source audio tokens for speech decoder conditioning
+        source_audio_tokens = None
+        if self.speech_generation.cond_on_source_audio_tokens:
+            source_audio_22k = resample(input_signal, self.source_sample_rate, self.target_sample_rate)
+            source_audio_22k_lens = (input_signal_lens.float() * self.target_sample_rate / self.source_sample_rate).long()
+            with fp32_precision(), torch.no_grad():
+                src_tokens, _ = self.audio_codec.encode(audio=source_audio_22k, audio_len=source_audio_22k_lens)
+            source_audio_tokens = src_tokens.transpose(1, 2)  # (B, C, T) -> (B, T, C)
+            # align length with source_encoded
+            if source_audio_tokens.shape[1] > T_local:
+                source_audio_tokens = source_audio_tokens[:, :T_local]
+
         # Determine decoding length and pad if FSDP
         # if self._use_fsdp:
         #     T_tensor = torch.tensor([T_local], device=source_encoded.device)
@@ -1077,7 +1110,7 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
             dist.all_reduce(T_tensor, op=dist.ReduceOp.MAX)
 
         # 3. Allow user override: control max decoding steps (can also use 2x input length heuristic)
-        T_config = self.cfg.get("inference_tgt_len", 1.2 * T_tensor.item())
+        T_config = self.cfg.get("inference_tgt_len", 1.3 * T_tensor.item())
         T = int(T_config)
 
         # 4. Pad `source_encoded` and `asr_emb` if T > T_local
@@ -1089,6 +1122,11 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
             last_frame_asr = asr_emb[:, T_local - 1 : T_local, :]
             pad_asr = last_frame_asr.repeat(1, T - T_local, 1)
             asr_emb = torch.cat([asr_emb, pad_asr], dim=1)
+
+            if source_audio_tokens is not None:
+                last_frame_tokens = source_audio_tokens[:, min(T_local, source_audio_tokens.shape[1]) - 1 : min(T_local, source_audio_tokens.shape[1]), :]
+                pad_tokens = last_frame_tokens.repeat(1, T - source_audio_tokens.shape[1], 1)
+                source_audio_tokens = torch.cat([source_audio_tokens, pad_tokens], dim=1)
         
 
         # Apply channel weight
@@ -1119,6 +1157,7 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
             modality_adapter_emb=source_encoded[:, :1],
             asr_emb=asr_emb[:, :1],
             speaker_encoder_emb=speaker_encoder_emb,  # for inference uses the cached inference_speaker_embedding
+            source_audio_tokens=source_audio_tokens[:, :1] if source_audio_tokens is not None else None,
         )
         gen_text[:, 0] = ans["text_logits"][:, -1].argmax(dim=-1)
         gen_audio[:, 0] = ans["audio_logits"][:, -1].argmax(dim=-1)
@@ -1143,6 +1182,7 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
                 modality_adapter_emb=source_encoded[:, t : t + 1],
                 asr_emb=asr_emb[:, t : t + 1],
                 speaker_encoder_emb=speaker_encoder_emb,  # for inference uses the cached inference_speaker_embedding
+                source_audio_tokens=source_audio_tokens[:, t : t + 1] if source_audio_tokens is not None else None,
             )
             gen_text[:, t] = ans["text_logits"][:, -1].argmax(dim=-1)
             gen_audio[:, t] = ans["audio_logits"][:, -1].argmax(dim=-1)
@@ -1205,7 +1245,6 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
         #     "tokens_audio": gen_audio,
         #     "tokens_len": lengths,
         # }
-        # breakpoint()
         ans = {
             "text": tokens_to_str(gen_text, gen_text_len, tokenizer=self.tokenizer, pad_id=self.text_pad_id),
             "tokens_text": gen_text,

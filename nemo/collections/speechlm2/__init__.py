@@ -12,7 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from .data import DataModule, DuplexS2SDataset, SALMDataset, DuplexS2SDatasetConcatV, DuplexS2SDatasetConcatVCodec
-from .models import SALM, DuplexS2SModel, DuplexS2SSpeechDecoderModel, DuplexS2SSpeechDecoderModel2, DuplexS2SSpeechDecoderModel2Codec
+from .models import (
+    SALM,
+    DuplexS2SModel,
+    DuplexS2SSpeechDecoderModel,
+    DuplexS2SSpeechDecoderModel2,
+    DuplexS2SSpeechDecoderModel2Codec,
+    Qwen3CodecDuplexS2SSpeechDecoderModel,
+    setup_qwen3_audio_codec,
+)
 
 __all__ = [
     'DataModule',
@@ -27,5 +35,7 @@ __all__ = [
     'DuplexS2SSpeechDecoderModelST',
     'DuplexS2SSpeechDecoderModel2',
     'DuplexS2SSpeechDecoderModel2Codec',
+    'Qwen3CodecDuplexS2SSpeechDecoderModel',
+    'setup_qwen3_audio_codec',
     'SALM',
 ]
