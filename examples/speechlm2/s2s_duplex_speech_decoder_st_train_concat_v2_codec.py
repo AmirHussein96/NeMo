@@ -43,7 +43,9 @@ def train(cfg):
         source_sample_rate=cfg.data.source_sample_rate,
         target_sample_rate=cfg.data.target_sample_rate,
         input_roles=cfg.data.input_roles,
-        output_roles=cfg.data.output_roles
+        output_roles=cfg.data.output_roles,
+        training_speaker_reference=cfg.data.get("training_speaker_reference", None),
+        training_speaker_duration=cfg.data.get("training_speaker_duration", 3.0),
     )
     datamodule = DataModule(cfg.data, tokenizer=model.tokenizer, dataset=dataset)
 

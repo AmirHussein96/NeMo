@@ -15,6 +15,7 @@ import re
 
 import torch
 import torch.utils.data
+import torchaudio
 
 from lhotse import CutSet, Seconds, compute_num_frames
 from lhotse.cut import Cut
@@ -89,6 +90,8 @@ class DuplexS2SDatasetConcatVCodec(torch.utils.data.Dataset):
         target_sample_rate: int,
         input_roles: list[str] = None,
         output_roles: list[str] = None,
+        training_speaker_reference: str = None,
+        training_speaker_duration: float = 3.0,
     ):
         self.tokenizer = tokenizer
         self.frame_length = frame_length
@@ -96,9 +99,25 @@ class DuplexS2SDatasetConcatVCodec(torch.utils.data.Dataset):
         self.target_sample_rate = target_sample_rate
         self.input_roles = set(ifnone(input_roles, ["user"]))
         self.output_roles = set(ifnone(output_roles, ["agent"]))
-        
+
         assert tokenizer.bos is not None, "BOS support in the tokenizer is required for S2S models."
         assert tokenizer.eos is not None, "EOS support in the tokenizer is required for S2S models."
+
+        if training_speaker_reference is not None:
+            audio, sr = torchaudio.load(training_speaker_reference)
+            if audio.shape[0] > 1:
+                audio = audio[0:1, :]
+            if sr != target_sample_rate:
+                audio = torchaudio.functional.resample(audio, sr, target_sample_rate)
+            max_samples = int(training_speaker_duration * target_sample_rate)
+            audio = audio[:, :max_samples]
+            self._fixed_spk_audio = audio.squeeze(0)
+            logging.info(
+                "Fixed training speaker reference loaded: %s (%d samples @ %dHz)",
+                training_speaker_reference, self._fixed_spk_audio.shape[0], target_sample_rate,
+            )
+        else:
+            self._fixed_spk_audio = None
 
     def __getitem__(self, cuts: CutSet) -> dict:
         cuts = cuts.transform_text(_strip_timestamps)
@@ -119,13 +138,19 @@ class DuplexS2SDatasetConcatVCodec(torch.utils.data.Dataset):
         source_tokens, source_token_lens = collate_token_channel(
             cuts, self.tokenizer, self.frame_length, roles=self.input_roles
         )
-        # extract target speaker first turn audio to uses for speaker conditioning
-        # target_first_turn_audio, target_first_turn_audio_lens = collate_first_turn_audio(
-        #     cuts.resample(self.target_sample_rate), roles=self.output_roles, recording_field="target_audio"
-        # )
-        first_turn_audio, first_turn_audio_lens = collate_first_turn_audio_source(
-            cuts.resample(self.target_sample_rate), roles=self.input_roles
-        )
+        # extract speaker first turn audio for speaker conditioning
+        if self._fixed_spk_audio is not None:
+            batch_size = len(cuts)
+            fixed_len = self._fixed_spk_audio.shape[0]
+            first_turn_audio = (
+                self._fixed_spk_audio.unsqueeze(0).expand(batch_size, -1).clone()
+                .to(dtype=source_audio.dtype, device=source_audio.device)
+            )
+            first_turn_audio_lens = torch.full((batch_size,), fixed_len, dtype=torch.long, device=source_audio.device)
+        else:
+            first_turn_audio, first_turn_audio_lens = collate_first_turn_audio_source(
+                cuts.resample(self.target_sample_rate), roles=self.input_roles
+            )
 
         return {
             "sample_id": [str(cut.id) for cut in cuts],
