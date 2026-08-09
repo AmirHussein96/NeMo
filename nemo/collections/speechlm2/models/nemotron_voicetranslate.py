@@ -31,7 +31,6 @@ import tempfile
 
 import torch
 import torch.distributed as dist
-import torchaudio
 from lightning import LightningModule
 from omegaconf import DictConfig, OmegaConf
 from peft import PeftModel

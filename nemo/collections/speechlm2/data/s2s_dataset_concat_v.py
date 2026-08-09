@@ -15,7 +15,6 @@ import re
 
 import torch
 import torch.utils.data
-import torchaudio
 
 from lhotse import CutSet, Seconds, compute_num_frames
 from lhotse.cut import Cut
@@ -104,6 +103,8 @@ class DuplexS2SDatasetConcatV(torch.utils.data.Dataset):
         assert tokenizer.eos is not None, "EOS support in the tokenizer is required for S2S models."
 
         if training_speaker_reference is not None:
+            import torchaudio  # optional dependency, only needed for this feature
+
             audio, sr = torchaudio.load(training_speaker_reference)
             if audio.shape[0] > 1:
                 audio = audio[0:1, :]
