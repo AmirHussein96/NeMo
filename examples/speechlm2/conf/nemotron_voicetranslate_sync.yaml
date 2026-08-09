@@ -1,0 +1,258 @@
+# ============================================================================
+# NemotronVoiceTranslateSync — Evaluation Configuration
+# ============================================================================
+#
+# Model: NemotronVoiceTranslateSync
+#   • LLM backbone : Riva-Translate-4B-Instruct-v1.1 (speech encoder + causal LM)
+#   • TTS          : DuplexEARTTS (Nemotron-Nano-9B backbone, EAR autoregressive codec)
+#
+# Sync behaviour:
+#   The translated audio is offset by the source audio duration so the
+#   stereo WAV plays as a streaming interpreter:
+#     Channel 1 (source)     : source speech → silence
+#     Channel 2 (translation): silence       → translated speech
+#
+# Usage (via inference_nemotron_voicetranslate_sync.sh, or directly):
+#   torchrun --nproc_per_node=1 \
+#       examples/speechlm2/nemotron_voicetranslate_sync_eval.py \
+#       --config-path=examples/speechlm2/conf/ \
+#       --config-name=nemotron_voicetranslate_sync \
+#       ++checkpoint_path=/path/to/s2s.ckpt \
+#       ++pretrained_tts=/path/to/eartts.ckpt \
+#       exp_manager.explicit_log_dir=/path/to/results/
+# ============================================================================
+
+# Full NemotronVoiceTranslate checkpoint (.ckpt) — LLM + perception weights.
+# Set to null to use raw (un-fine-tuned) weights.
+checkpoint_path: /lustre/fsw/portfolios/llmservice/users/amhussein/s2s_exp/DFW_riva_translate_target_aligned2_asr0_6B_8nodes_encoder_70_st_concat_v_mfa2_multiling_target_aligned2_1.5/checkpoints/step17005.ckpt
+
+# Standalone DuplexEARTTS checkpoint — TTS sub-module weights only.
+# Overrides the TTS portion of checkpoint_path when provided.
+pretrained_tts: /lustre/fsw/portfolios/edgeai/users/marianag/edresson/hard_ft_with_longform/ckpts_to_eval/fp32_24ksteps.ckpt
+
+model:
+  # ── LLM backbone ──────────────────────────────────────────────────────────
+  # Use local HF cache path to avoid re-downloading (set TRANSFORMERS_OFFLINE=1).
+  pretrained_llm: /lustre/fsw/portfolios/llmservice/users/amhussein/HFCACHE/hub/models--nvidia--Riva-Translate-4B-Instruct-v1.1/snapshots/f859e48c4c82696c5929cd06590f600a41dc7f3c
+  pretrained_weights: false   # weights come from checkpoint_path — skip HF weight load
+
+  # ASR model used to transcribe generated speech for ASR-BLEU scoring.
+  scoring_asr: stt_en_fastconformer_transducer_large
+
+  # Pooling factor between speech encoder output and LLM (must match training).
+  hidden_pooling_factor: 2
+
+  # ── Speaker conditioning ──────────────────────────────────────────────────
+  # inference_use_source_speaker: when true (recommended for translation) the
+  # source speaker's voice is cloned per-sample from the input audio itself.
+  # Each utterance in the batch gets its own voice profile; no external reference
+  # file needed.  Set to false and provide inference_speaker_reference instead
+  # if you want a fixed target voice.
+  inference_use_source_speaker: true
+
+  # Fixed reference .wav path — only used when inference_use_source_speaker=false.
+  # Set to null (and inference_use_source_speaker=false) to fall back to the
+  # named preset below.
+  inference_speaker_reference: null
+
+  # Named speaker preset built into DuplexEARTTS — only used when both
+  # inference_use_source_speaker=false and inference_speaker_reference=null.
+  inference_speaker_name: null
+
+  # ── Speech encoder (perception) ───────────────────────────────────────────
+  perception:
+    target: nemo.collections.multimodal.speech_llm.modules.perception_modules.AudioPerceptionModule
+    use_multi_layer_feat: false
+    add_sep: true
+    is_canary: true
+    preprocessor:
+      normalize: 'NA'
+
+    encoder:
+      self_attention_model: rel_pos
+      att_context_size: [70, 0]
+      conv_context_size: causal
+      conv_norm_type: layer_norm
+
+    modality_adapter:
+      _target_: nemo.collections.asr.modules.ConformerEncoder
+      feat_in: 1024
+      feat_out: -1
+      n_layers: 2
+      d_model: 512
+      subsampling: dw_striding
+      subsampling_factor: 1
+      subsampling_conv_channels: 256
+      causal_downsampling: true
+      ff_expansion_factor: 4
+      self_attention_model: rel_pos
+      n_heads: 8
+      att_context_size: [70, 0]
+      att_context_style: chunked_limited
+      xscaling: true
+      untie_biases: true
+      pos_emb_max_len: 5000
+      conv_kernel_size: 9
+      conv_norm_type: layer_norm
+      conv_context_size: causal
+      dropout: 0
+      dropout_pre_encoder: 0
+      dropout_emb: 0.0
+      dropout_att: 0
+
+    spec_augment:
+      _target_: nemo.collections.asr.modules.SpectrogramAugmentation
+      freq_masks: 0   # disabled at inference
+      time_masks: 0   # disabled at inference
+      freq_width: 27
+      time_width: 0.05
+
+  # ── DuplexEARTTS speech generation ────────────────────────────────────────
+  # This entire sub-tree is forwarded verbatim to DuplexEARTTS.__init__.
+  # Architecture (codec_config, tts_config) must match the EAR TTS checkpoint.
+  # Verified against marianag eval_config.yaml (fp32_24ksteps checkpoint).
+  speech_generation:
+    # pretrained_lm_name is ONLY used to load the AutoTokenizer.
+    # With context_hidden_size=null (below), the 9B weights are never loaded
+    # (see duplex_ear_tts.py line 85: branch skipped when context_hidden_size is None).
+    # Absolute local path — no HF download needed (HF_HUB_OFFLINE=1 safe).
+    # Alternatively: set tokenizer_path to a tokenizer-only dir and leave this null.
+    pretrained_lm_name: /lustre/fsw/portfolios/edgeai/users/marianag/voicechat/inference/.cache/hf_cache/hub/models--nvidia--NVIDIA-Nemotron-Nano-9B-v2/snapshots/6533e8de2c68e4536bf7c411d7a3ce5734111476
+    trust_remote_code: false
+
+    # Special tokens for the TTS tokenizer (Nemotron/Mistral family).
+    bos_token: "<s>"
+    eos_token: "</s>"
+    pad_token: "<SPECIAL_12>"
+
+    # Path to the pretrained audio codec checkpoint (.safetensors / .ckpt / .nemo).
+    # Must match EXACTLY what was used when training the EAR TTS checkpoint.
+    # fp32_24ksteps.ckpt was trained with codec-ema.safetensors (marianag eval_config.yaml).
+    pretrained_codec_model: /lustre/fsw/portfolios/edgeai/users/marianag/edresson/ckpts/codec-ema.safetensors
+
+    # ── Inference hyper-parameters (from marianag fp32_24k eval script) ────
+    inference_guidance_scale: 0.2
+    inference_noise_scale: 0.001
+    inference_top_p_or_k: 0.95
+    inference_guidance_enabled: true
+    inference_force_speech_silence_on_eos: true
+    inference_num_delay_speech_tokens: 0
+    use_audio_prompt_frozen_projection: true
+
+    # ── Audio codec architecture (NanoCodec 1.78 kbps, 12.5 FPS) ─────────
+    codec_config:
+      latent_size: 512
+      n_fft: 16
+      hop_length: 4
+      base_hidden_size: 384
+      channel_mult:
+        - 1
+        - 2
+        - 4
+      rates:
+        - 7
+        - 7
+        - 9
+      num_blocks: 3
+      kernel_size: 7
+      groups: 1
+      codebook_size: 1024
+      num_quantizers: 31
+      wav_to_token_ratio: 1764
+
+    # ── TTS backbone architecture (verified against marianag eval_config) ──
+    tts_config:
+      use_gated_fusion_for_text_audio: true
+      disable_eos_prediction: true
+      use_bos_eos_emb: true
+      use_subword_flag_emb: true
+      num_delay_speech_tokens: 2
+      backbone_type: gemma3_text
+      backbone_model_class: null
+      backbone_config_class: null
+      backbone_config:
+        hidden_size: 1152
+        intermediate_size: 4608
+        num_hidden_layers: 28
+        num_attention_heads: 16
+        num_key_value_heads: 16
+        head_dim: 72
+        attention_dropout: 0.1
+        use_cache: false
+      latent_size: 512
+      codebook_size: 1024
+      num_quantizers: 31
+      context_hidden_size: null
+      cas_config:
+        backbone_type: t5gemma
+        backbone_model_class: null
+        backbone_config_class: null
+        backbone_config:
+          is_encoder_decoder: false
+          encoder:
+            hidden_size: 1152
+            intermediate_size: 4608
+            num_hidden_layers: 1
+            num_attention_heads: 16
+            num_key_value_heads: 16
+            head_dim: 72
+            use_cache: false
+            attention_dropout: 0.1
+      mog_head_config:
+        intermediate_size: 4608
+        num_layers: 3
+        low_rank: 64
+        num_predictions: 1024
+        min_log_std: -4.0
+        eps: 1.0e-06
+      p_uncond: 0.1
+      label_smoothing: 0.01
+      max_training_rate: 0.8
+      quantizer_dropout: 0.5
+      random_target_masking: false
+      exponent: 3.0
+
+# ── PyTorch Lightning Trainer ────────────────────────────────────────────────
+trainer:
+  devices: -1
+  accelerator: gpu
+  num_nodes: 1
+  precision: 32           # use 32 for stable codec decoding
+  logger: false
+  limit_val_batches: 1.0
+  log_every_n_steps: 20
+  use_distributed_sampler: false
+  strategy:
+    _target_: lightning.pytorch.strategies.DDPStrategy
+    gradient_as_bucket_view: true
+    find_unused_parameters: true
+
+# ── Data pipeline ────────────────────────────────────────────────────────────
+data:
+  frame_length: 0.08
+  source_sample_rate: 16000
+  target_sample_rate: 22050
+  input_roles: ["user", "User"]
+  output_roles: ["agent", "Assistant", "assistant", "Agent"]
+
+  validation_ds:
+    datasets:
+      cvss_FrTest:
+        shar_path: /lustre/fsw/portfolios/llmservice/users/amhussein/lhotse_data_eval_mfa/cvss/fr-FR_en-US/test
+      cvss_EsTest:
+        shar_path: /lustre/fsw/portfolios/llmservice/users/amhussein/lhotse_data_eval_mfa/cvss/es-US_en-US/test
+      cvss_DeTest:
+        shar_path: /lustre/fsw/portfolios/llmservice/users/amhussein/lhotse_data_eval_mfa/cvss/de-DE_en-US/test
+
+    sample_rate: ${data.target_sample_rate}
+    batch_size: 32
+    seed: 42
+    shard_seed: "randomized"
+
+# ── Experiment manager ────────────────────────────────────────────────────────
+exp_manager:
+  explicit_log_dir: /lustre/fsw/portfolios/llmservice/users/amhussein/s2s_exp/nemotron_voicetranslate_sync_eval/
+  name: nemotron-voicetranslate-sync-eval
+  create_tensorboard_logger: false
+  create_checkpoint_callback: false
+  use_datetime_version: true

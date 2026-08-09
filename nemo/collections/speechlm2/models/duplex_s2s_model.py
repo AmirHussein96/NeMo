@@ -616,3 +616,12 @@ def replace_control_speech_codes(speech_codes: torch.Tensor, control_codes: torc
     assumed to consist of 'valid' codes representing silence.
     """
     return torch.where(torch.isin(speech_codes, control_codes), speech_codes[:, :1], speech_codes)
+
+
+def tokens_to_str(tokens: torch.Tensor, lengths: torch.Tensor, tokenizer: AutoTokenizer, pad_id: int) -> list[str]:
+    ans = []
+    for hyp_ids, hyp_len in zip(tokens.cpu(), lengths.cpu()):
+        hyp_ids = hyp_ids[:hyp_len]
+        hyp_ids = hyp_ids[hyp_ids != pad_id]
+        ans.append(tokenizer.ids_to_text(hyp_ids))
+    return ans

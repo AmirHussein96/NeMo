@@ -15,11 +15,13 @@ from .datamodule import DataModule
 from .duplex_ear_tts_dataset import DuplexEARTTSDataset
 from .duplex_stt_dataset import DuplexSTTDataset
 from .s2s_dataset import DuplexS2SDataset
+from .s2s_dataset_concat_v import DuplexS2SDatasetConcatV
 from .salm_dataset import SALMDataset
 
 __all__ = [
     'DataModule',
     'DuplexS2SDataset',
+    'DuplexS2SDatasetConcatV',
     'DuplexSTTDataset',
     'DuplexEARTTSDataset',
     'SALMDataset',

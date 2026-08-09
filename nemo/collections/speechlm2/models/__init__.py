@@ -16,6 +16,9 @@ from .duplex_s2s_model import DuplexS2SModel
 from .duplex_s2s_speech_decoder_model import DuplexS2SSpeechDecoderModel
 from .duplex_stt_model import DuplexSTTModel
 from .nemotron_voicechat import NemotronVoiceChat
+from .nemotron_voicetranslate import NemotronVoiceTranslate
+from .nemotron_voicetranslate_sync_v2 import NemotronVoiceTranslateSyncV2
+from .nemotron_voicetranslate_sync_v3 import NemotronVoiceTranslateSyncV3
 from .salm import SALM
 from .salm_asr_decoder import SALMWithAsrDecoder
 from .salm_automodel import SALMAutomodel
@@ -29,4 +32,7 @@ __all__ = [
     'SALMAutomodel',
     'SALMWithAsrDecoder',
     'NemotronVoiceChat',
+    'NemotronVoiceTranslate',
+    'NemotronVoiceTranslateSyncV2',
+    'NemotronVoiceTranslateSyncV3',
 ]
