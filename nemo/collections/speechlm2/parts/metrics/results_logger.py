@@ -106,23 +106,23 @@ class ResultsLogger:
 
     def reset(self):
         self.cached_results = defaultdict(list)
-        metadata_files = os.listdir(self.metadata_save_path)
-        for f in metadata_files:
-            open(os.path.join(self.metadata_save_path, f), 'w').close()
+        # Truncate (wipe) all existing metadata JSON files so they start fresh.
+        for f in os.listdir(self.metadata_save_path):
+            if f.endswith('.json'):
+                open(os.path.join(self.metadata_save_path, f), 'w').close()
 
-        # clean out any existing .wav predictions safely
+        # clean out any existing .wav predictions safely (including sub-folder wavs)
         try:
-            audio_files = os.listdir(self.audio_save_path)
-            for f in audio_files:
-                if f.lower().endswith(".wav"):
-                    try:
-                        os.remove(os.path.join(self.audio_save_path, f))
-                    except FileNotFoundError:
-                        pass  # already gone
-                    except Exception:
-                        logging.warning(f"Failed to remove audio file {f} during reset.", stack_info=False)
+            for dirpath, _dirnames, filenames in os.walk(self.audio_save_path):
+                for f in filenames:
+                    if f.lower().endswith(".wav"):
+                        try:
+                            os.remove(os.path.join(dirpath, f))
+                        except FileNotFoundError:
+                            pass
+                        except Exception:
+                            logging.warning(f"Failed to remove audio file {f} during reset.", stack_info=False)
         except FileNotFoundError:
-            # directory somehow missing: recreate it
             os.makedirs(self.audio_save_path, exist_ok=True)
 
         return self
@@ -181,9 +181,11 @@ class ResultsLogger:
 
         for i in range(len(refs)):
             sample_id = samples_id[i][:150]
-            # Add rank info to audio filename to avoid conflicts
+            out_audio_path = None
             if pred_audio is not None:
-                out_audio_path = os.path.join(self.audio_save_path, f"{name}_{sample_id}_rank{rank}.wav")
+                # Save each dataset's audio in its own sub-folder.
+                out_audio_path = os.path.join(self.audio_save_path, name, f"{sample_id}.wav")
+                os.makedirs(os.path.dirname(out_audio_path), exist_ok=True)
                 self.merge_and_save_audio(
                     out_audio_path,
                     pred_audio[i],
@@ -194,7 +196,8 @@ class ResultsLogger:
 
             # Save additional audio artifacts if provided (from upstream)
             if pred_audio_tf is not None:
-                out_audio_path_tf = os.path.join(self.audio_save_path, f"{name}_{sample_id}_rank{rank}_tf.wav")
+                out_audio_path_tf = os.path.join(self.audio_save_path, name, f"{sample_id}_rank{rank}_tf.wav")
+                os.makedirs(os.path.dirname(out_audio_path_tf), exist_ok=True)
                 self.merge_and_save_audio(
                     out_audio_path_tf,
                     pred_audio_tf[i],
@@ -204,7 +207,8 @@ class ResultsLogger:
                 )
 
             if target_audio is not None:
-                out_audio_path_gt = os.path.join(self.audio_save_path, f"{name}_{sample_id}_rank{rank}_GT.wav")
+                out_audio_path_gt = os.path.join(self.audio_save_path, name, f"{sample_id}_rank{rank}_GT.wav")
+                os.makedirs(os.path.dirname(out_audio_path_gt), exist_ok=True)
                 self.merge_and_save_audio(
                     out_audio_path_gt,
                     target_audio[i],
@@ -215,7 +219,8 @@ class ResultsLogger:
 
             # Create a wav with eou prediction for debug purposes
             if eou_pred is not None and fps is not None:
-                out_audio_path_eou = os.path.join(self.audio_save_path, f"{name}_{sample_id}_rank{rank}_eou.wav")
+                out_audio_path_eou = os.path.join(self.audio_save_path, name, f"{sample_id}_rank{rank}_eou.wav")
+                os.makedirs(os.path.dirname(out_audio_path_eou), exist_ok=True)
                 repeat_factor = int(pred_audio_sr / fps)
                 eou_pred_wav = (
                     eou_pred[i].unsqueeze(0).unsqueeze(-1).repeat(1, 1, repeat_factor)
@@ -230,8 +235,9 @@ class ResultsLogger:
 
             if pre_audio_trimmed is not None:
                 out_audio_path_trimmed = os.path.join(
-                    self.audio_save_path, f"{name}_{sample_id}_rank{rank}_pred_trimmed.wav"
+                    self.audio_save_path, name, f"{sample_id}_rank{rank}_pred_trimmed.wav"
                 )
+                os.makedirs(os.path.dirname(out_audio_path_trimmed), exist_ok=True)
                 sf.write(
                     out_audio_path_trimmed,
                     pre_audio_trimmed[i].squeeze().unsqueeze(0).detach().cpu().numpy().astype('float32').T,
@@ -240,8 +246,9 @@ class ResultsLogger:
 
             if reference_audio is not None:
                 out_audio_path_ref = os.path.join(
-                    self.audio_save_path, f"{name}_{sample_id}_rank{rank}_spk_reference.wav"
+                    self.audio_save_path, name, f"{sample_id}_rank{rank}_spk_reference.wav"
                 )
+                os.makedirs(os.path.dirname(out_audio_path_ref), exist_ok=True)
                 sf.write(
                     out_audio_path_ref,
                     reference_audio[i].squeeze().unsqueeze(0).detach().cpu().numpy().astype('float32').T,
@@ -253,7 +260,8 @@ class ResultsLogger:
                 "id": sample_id,
                 "target_text": refs[i],
                 "pred_text": hyps[i],
-                "pred_audio": asr_hyps[i] if asr_hyps is not None else None,
+                "speech_pred_transcribed": asr_hyps[i] if asr_hyps is not None else None,
+                "pred_audio_path": out_audio_path if pred_audio is not None else None,
             }
 
             # Add source text fields if provided (DuplexSTTModel)
@@ -269,6 +277,17 @@ class ResultsLogger:
                 else:
                     out_dict['tokens_text'] = results['tokens_text'][i].tolist()
 
+            # Write immediately to disk so metadata survives a Ctrl+C or crash.
+            # Rank-0 (and single-GPU) writes directly to {name}.json; other ranks
+            # use a rank suffix so they don't collide during multi-GPU runs.
+            if rank == 0:
+                rank_json_path = os.path.join(self.metadata_save_path, f"{name}.json")
+            else:
+                rank_json_path = os.path.join(self.metadata_save_path, f"{name}_rank{rank}.json")
+            with open(rank_json_path, 'a', encoding='utf-8') as fout:
+                fout.write(json.dumps(out_dict, ensure_ascii=False, indent=2) + '\n\n')
+
+            # Also keep in memory for backward compatibility.
             self.cached_results[name].append(out_dict)
 
     def _merge_rank_files(self, dataset_name: str) -> List[dict]:
@@ -289,7 +308,11 @@ class ResultsLogger:
 
         # Collect results from all ranks
         for r in range(world_size):
-            rank_file = os.path.join(self.metadata_save_path, f"{dataset_name}_rank{r}.json")
+            # Rank 0 writes directly to {name}.json; other ranks use _rank{r}.json.
+            if r == 0:
+                rank_file = os.path.join(self.metadata_save_path, f"{dataset_name}.json")
+            else:
+                rank_file = os.path.join(self.metadata_save_path, f"{dataset_name}_rank{r}.json")
 
             # Wait for the file to exist (with timeout)
             wait_time = 0
@@ -301,11 +324,11 @@ class ResultsLogger:
             if os.path.exists(rank_file):
                 try:
                     with open(rank_file, 'r', encoding='utf-8') as fin:
-                        rank_results = [json.loads(line) for line in fin if line.strip()]
-                        if isinstance(rank_results, list):
-                            all_results.extend(rank_results)
-                        else:
-                            logging.warning(f"Unexpected format in {rank_file}: {type(rank_results)}")
+                        content = fin.read().strip()
+                        # Entries are pretty-printed JSON blocks separated by blank lines.
+                        blocks = [b.strip() for b in content.split('\n\n') if b.strip()]
+                        rank_results = [json.loads(b) for b in blocks]
+                        all_results.extend(rank_results)
                 except Exception as e:
                     logging.warning(f"Failed to read {rank_file}: {e}")
             else:
@@ -341,21 +364,33 @@ class ResultsLogger:
         world_size = get_world_size()
         metrics_results = {}
 
-        # Step 1: Each rank saves its own results with rank suffix
-        for name, results_list in self.cached_results.items():
-            rank_json_path = os.path.join(self.metadata_save_path, f"{name}_rank{rank}.json")
-            with open(rank_json_path, 'w', encoding='utf-8') as fout:
-                for item in results_list:
-                    fout.write(json.dumps(item, ensure_ascii=False) + '\n')
+        # Step 1: Rank files are already written incrementally by update().
+        # Log their paths so the user can see them.
+        for name in self.cached_results.keys():
+            if rank == 0:
+                rank_json_path = os.path.join(self.metadata_save_path, f"{name}.json")
+            else:
+                rank_json_path = os.path.join(self.metadata_save_path, f"{name}_rank{rank}.json")
             logging.info(f"Rank {rank} metadata file for {name} dataset saved at: {rank_json_path}")
 
         # Step 2: Synchronize all ranks before merging
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.barrier()
 
-        # Step 3: Only rank 0 merges all results and computes final metrics
+        # Step 3: Only rank 0 merges all results and computes final metrics.
+        # Dataset names are discovered from the rank files on disk so this also
+        # works when called on a fresh ResultsLogger instance (e.g. after a crash).
         if rank == 0:
-            for name in self.cached_results.keys():
+            # Rank-0 writes directly to {name}.json; other ranks use _rank{r}.json.
+            # Discover dataset names from {name}.json files (exclude rank-suffix files).
+            disk_names = set()
+            for f in os.listdir(self.metadata_save_path):
+                if f.endswith('.json') and '_rank' not in f:
+                    disk_names.add(f[:-len('.json')])
+            # Fall back to cached_results if no files exist yet (safety).
+            all_names = disk_names if disk_names else set(self.cached_results.keys())
+
+            for name in sorted(all_names):
                 # Merge results from all ranks
                 merged_results = self._merge_rank_files(name)
 
@@ -363,8 +398,19 @@ class ResultsLogger:
                 final_json_path = os.path.join(self.metadata_save_path, f"{name}.json")
                 with open(final_json_path, 'w', encoding='utf-8') as fout:
                     for item in merged_results:
-                        fout.write(json.dumps(item, ensure_ascii=False) + '\n')
+                        fout.write(json.dumps(item, ensure_ascii=False, indent=2) + '\n\n')
                 logging.info(f"Final merged metadata file for {name} dataset saved at: {final_json_path}")
+
+                # Remove intermediate rank files (rank 1+) now that the merged
+                # file exists.  Rank-0 writes directly to {name}.json so there
+                # is no separate _rank0 file to clean up.
+                for r in range(1, world_size):
+                    rank_file = os.path.join(self.metadata_save_path, f"{name}_rank{r}.json")
+                    try:
+                        if os.path.exists(rank_file):
+                            os.remove(rank_file)
+                    except Exception as e:
+                        logging.warning(f"Could not remove intermediate rank file {rank_file}: {e}")
 
                 # Compute metrics on merged results
                 if name in special_subset_names and merged_results:

@@ -152,6 +152,20 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
             self.tokenizer.eos_token = '</s>'
             if self.cfg.get("use_extra_id_for_pad", False):
                 self.tokenizer.pad_token = '<|extra_1|>'
+            elif self.tokenizer.pad_token == self.tokenizer.eos_token:
+                # The checkpoint's own tokenizer_config.json is inconsistent across
+                # Riva-Translate releases: v1.1 has no pad_token set at all (HF leaves it
+                # None -> get_pad_id() safely falls back to <unk>, distinct from bos/eos), but
+                # v2 explicitly sets pad_token="</s>", i.e. identical to eos_token. When
+                # pad_token == eos_token, every silent/non-speaking frame in the duplex
+                # sequence (the majority of frames) gets labeled and embedded as EOS, so the
+                # model learns to predict EOS almost everywhere. Loss still looks fine
+                # (dominated by the audio-token loss) but generated text collapses to
+                # near-immediate EOS, causing BLEU == 0. Only override in this specific
+                # colliding case (leaving v1.1 and any other well-behaved checkpoint
+                # untouched, to stay compatible with already-trained checkpoints); use the
+                # shared vocab's dedicated, otherwise-unused '<pad>' token instead.
+                self.tokenizer.pad_token = '<pad>'
         
         if 'Qwen2.5' in self.cfg.pretrained_llm:
             # For Qwen, '<|im_start|>' is a common choice for a BOS token.
