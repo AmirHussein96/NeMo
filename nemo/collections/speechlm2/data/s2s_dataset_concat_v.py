@@ -25,6 +25,13 @@ from nemo.collections.common.tokenizers import TokenizerSpec
 from nemo.collections.speechlm2.data.utils import get_pad_id
 from nemo.utils import logging
 
+_DEFAULT_LANG_MAP = {
+    "en": "English",
+    "de": "German",
+    "es": "Spanish",
+    "fr": "French",
+}
+
 
 class DuplexS2SDatasetConcatV(torch.utils.data.Dataset):
     """
@@ -56,6 +63,19 @@ class DuplexS2SDatasetConcatV(torch.utils.data.Dataset):
         output_roles (list[str], optional):
             List of speaker roles (cut.supervisions[:].speaker) to consider as outputs. Defaults to ["agent"].
 
+        add_lang_prompt (bool, optional):
+            If True, prepend a language-direction instruction token sequence before the
+            audio stream for each sample. The prompt is built from ``cut.custom["lang_src"]``
+            and ``cut.custom["lang_tgt"]`` (e.g. ``"de"`` and ``"es"``) and tokenized as:
+            ``<bos> System\\nTranslate from {src} to {tgt}. <eos>``.
+            Silence audio is inserted in both channels to keep frame alignment.
+            Default: ``False``.
+
+        lang_map (dict, optional):
+            Mapping from 2-letter ISO code to full language name used when building the
+            prompt text. Defaults to ``{"en": "English", "de": "German",
+            "es": "Spanish", "fr": "French"}``.
+
     Returns:
         A dictionary with the following keys:
             - source_audio: Tensor of source waveform samples [B, T]
@@ -69,6 +89,8 @@ class DuplexS2SDatasetConcatV(torch.utils.data.Dataset):
                 at positions aligned with audio frames
             - source_token_lens: Tensor of source token sequence lengths [B]
             - target_texts: List of full target texts joined from output_roles supervisions [B]
+            - lang_prompt: List of raw lang_pair strings per sample (empty string if disabled) [B]
+            - prompt_lens: List of prompt lengths in tokens per sample (0 if disabled) [B]
 
     Notes:
         - The dataset ensures frame-level alignment between audio and text by inserting tokens at
@@ -91,6 +113,8 @@ class DuplexS2SDatasetConcatV(torch.utils.data.Dataset):
         output_roles: list[str] = None,
         training_speaker_reference: str = None,
         training_speaker_duration: float = 3.0,
+        add_lang_prompt: bool = False,
+        lang_map: dict = None,
     ):
         self.tokenizer = tokenizer
         self.frame_length = frame_length
@@ -99,6 +123,10 @@ class DuplexS2SDatasetConcatV(torch.utils.data.Dataset):
         self.input_roles = set(ifnone(input_roles, ["user"]))
         self.output_roles = set(ifnone(output_roles, ["agent"]))
         self.training_speaker_duration = training_speaker_duration
+        self.add_lang_prompt = add_lang_prompt
+        self.lang_map = lang_map if lang_map is not None else _DEFAULT_LANG_MAP
+        self.source_samples_per_frame = int(source_sample_rate * frame_length)
+        self.target_samples_per_frame = int(target_sample_rate * frame_length)
         assert tokenizer.bos is not None, "BOS support in the tokenizer is required for S2S models."
         assert tokenizer.eos is not None, "EOS support in the tokenizer is required for S2S models."
 
@@ -119,6 +147,31 @@ class DuplexS2SDatasetConcatV(torch.utils.data.Dataset):
             )
         else:
             self._fixed_spk_audio = None
+
+    def _build_lang_prompt_tokens(self, src_lang: str, tgt_lang: str, device: torch.device) -> torch.Tensor:
+        """
+        Build a token sequence for a language direction prompt.
+
+        Looks up ``src_lang`` and ``tgt_lang`` (e.g. ``"de"``, ``"es"``) in
+        ``self.lang_map`` and tokenizes:
+
+            <bos> System\\nTranslate from {src_name} to {tgt_name}. <eos>
+
+        Falls back to ``<eos>`` only when a code is unknown or missing.
+        """
+        try:
+            src_name = self.lang_map.get(src_lang.lower())
+            tgt_name = self.lang_map.get(tgt_lang.lower())
+            if src_name is None or tgt_name is None:
+                raise ValueError(f"Unknown language code(s): {src_lang!r}, {tgt_lang!r}")
+            prompt_text = f"System\nTranslate from {src_name} to {tgt_name}."
+            ids = [self.tokenizer.bos] + self.tokenizer.text_to_ids(prompt_text) + [self.tokenizer.eos]
+        except Exception as e:
+            logging.warning(
+                f"[DuplexS2SDatasetConcatV] Could not build lang prompt for {src_lang!r}->{tgt_lang!r}: {e}. Using EOS only."
+            )
+            ids = [self.tokenizer.eos]
+        return torch.tensor(ids, dtype=torch.long, device=device)
 
     def __getitem__(self, cuts: CutSet) -> dict:
         cuts = cuts.transform_text(_strip_timestamps)
@@ -152,6 +205,30 @@ class DuplexS2SDatasetConcatV(torch.utils.data.Dataset):
                 cuts.resample(self.target_sample_rate), roles=self.input_roles, duration=self.training_speaker_duration
             )
 
+        # --- optional language-direction prompt ---
+        # Prompt tokens are returned as a SEPARATE field (DuplexSTT-style).
+        # The model's prepare_inputs inserts them into source_encoded at the feature level,
+        # so target_tokens/audio are NOT modified here — no loss masking needed.
+        lang_prompts_raw = []
+        prompt_token_lens_list = []
+        prompt_ids_list = []
+        if self.add_lang_prompt:
+            pad_id = get_pad_id(self.tokenizer)
+            for i, cut in enumerate(cuts):
+                custom = cut.custom or {}
+                src_lang = custom.get("lang_src", "")
+                tgt_lang = custom.get("lang_tgt", "")
+                prompt_ids = self._build_lang_prompt_tokens(src_lang, tgt_lang, device=target_tokens.device)
+                prompt_ids_list.append(prompt_ids)
+                prompt_token_lens_list.append(len(prompt_ids))
+                lang_prompts_raw.append(f"{src_lang}-{tgt_lang}")
+            prompt_tokens = collate_vectors(prompt_ids_list, padding_value=pad_id)
+            prompt_token_lens = torch.tensor(prompt_token_lens_list, dtype=torch.long)
+        else:
+            lang_prompts_raw = [""] * len(cuts)
+            prompt_tokens = None
+            prompt_token_lens = torch.zeros(len(cuts), dtype=torch.long)
+
         return {
             "sample_id": [str(cut.id) for cut in cuts],
             "source_audio": source_audio,
@@ -169,6 +246,9 @@ class DuplexS2SDatasetConcatV(torch.utils.data.Dataset):
             "first_turn_audio": first_turn_audio,
             "first_turn_audio_lens": first_turn_audio_lens,
             "formatter": [getattr(cut, "formatter", "s2s_duplex") for cut in cuts],
+            "lang_prompt": lang_prompts_raw,
+            "prompt_token_lens": prompt_token_lens,
+            **( {"prompt_tokens": prompt_tokens} if prompt_tokens is not None else {} ),
         }
 
 

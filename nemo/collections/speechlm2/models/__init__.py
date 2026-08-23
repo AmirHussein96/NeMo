@@ -15,6 +15,7 @@ from .duplex_ear_tts import DuplexEARTTS
 from .duplex_s2s_model import DuplexS2SModel
 from .duplex_s2s_speech_decoder_model import DuplexS2SSpeechDecoderModel
 from .duplex_s2s_speech_decoder_model2 import DuplexS2SSpeechDecoderModel2
+from .nemotron_voicetranslate_stt_model import NemotronVoiceTranslateSTT
 from .duplex_stt_model import DuplexSTTModel
 from .nemotron_voicechat import NemotronVoiceChat
 from .nemotron_voicetranslate import NemotronVoiceTranslate
@@ -28,6 +29,7 @@ __all__ = [
     'DuplexS2SModel',
     'DuplexS2SSpeechDecoderModel',
     'DuplexS2SSpeechDecoderModel2',
+    'NemotronVoiceTranslateSTT',
     'DuplexSTTModel',
     'DuplexEARTTS',
     'SALM',

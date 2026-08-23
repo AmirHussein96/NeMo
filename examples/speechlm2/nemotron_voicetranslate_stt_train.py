@@ -1,0 +1,73 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""
+Training entry point for NemotronVoiceTranslateSTT — a speech-to-text translation
+model that uses a streaming ASR encoder + a pretrained LLM (e.g. Riva-Translate-4B)
+to produce text translations from source speech, with optional many-to-many language
+direction prompting.
+
+Usage (single node, 8 GPUs):
+    python examples/speechlm2/nemotron_voicetranslate_stt_train.py \
+        --config-path=<path_to_configs> \
+        --config-name=<config_name> \
+        ++model.pretrained_asr=<path_to_asr.nemo> \
+        ++model.pretrained_llm=<path_to_llm_dir> \
+        ++data.add_lang_prompt=true \
+        trainer.num_nodes=1 \
+        exp_manager.explicit_log_dir=<results_dir>
+"""
+import os
+
+import torch
+from lightning.pytorch import Trainer
+from omegaconf import OmegaConf
+
+from nemo.collections.speechlm2 import DataModule, DuplexS2SDatasetConcatV, NemotronVoiceTranslateSTT
+from nemo.core.config import hydra_runner
+from nemo.utils.exp_manager import exp_manager
+from nemo.utils.trainer_utils import resolve_trainer_cfg
+
+torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+
+
+@hydra_runner(config_path="conf", config_name="nemotron_voicetranslate_stt")
+def train(cfg):
+    OmegaConf.resolve(cfg)
+    torch.distributed.init_process_group(backend="nccl")
+    torch.set_float32_matmul_precision("medium")
+    torch.backends.cudnn.allow_tf32 = True
+    trainer = Trainer(**resolve_trainer_cfg(cfg.trainer))
+    log_dir = exp_manager(trainer, cfg.get("exp_manager", None))
+    OmegaConf.save(cfg, log_dir / "exp_config.yaml")
+
+    with trainer.init_module():
+        model = NemotronVoiceTranslateSTT(OmegaConf.to_container(cfg, resolve=True))
+
+    dataset = DuplexS2SDatasetConcatV(
+        tokenizer=model.tokenizer,
+        frame_length=cfg.data.frame_length,
+        source_sample_rate=cfg.data.source_sample_rate,
+        target_sample_rate=cfg.data.source_sample_rate,  # STT: no target audio generation
+        input_roles=cfg.data.input_roles,
+        output_roles=cfg.data.output_roles,
+        add_lang_prompt=cfg.data.get("add_lang_prompt", False),
+        lang_map=cfg.data.get("lang_map", None),
+    )
+    datamodule = DataModule(cfg.data, tokenizer=model.tokenizer, dataset=dataset)
+
+    trainer.fit(model, datamodule)
+
+
+if __name__ == "__main__":
+    train()
