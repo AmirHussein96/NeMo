@@ -977,6 +977,7 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
         text_eos_acc = self.text_eos_acc.compute()
         for k, m in text_eos_acc.items():
             self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+        self.results_logger.compute_and_save()
 
     def validation_step(self, batch: dict, batch_idx: int):
 

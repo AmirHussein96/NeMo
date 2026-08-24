@@ -487,6 +487,7 @@ class NemotronVoiceTranslateSTT(LightningModule, HFHubMixin):
         pass
 
     def on_validation_epoch_start(self) -> None:
+        self.on_train_epoch_start()
         self.results_logger = ResultsLogger(self.validation_save_path).reset()
         self.bleu = BLEU().reset()
         tolerance = int(
@@ -509,6 +510,7 @@ class NemotronVoiceTranslateSTT(LightningModule, HFHubMixin):
         text_eos_acc = self.text_eos_acc.compute()
         for k, m in text_eos_acc.items():
             self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+        self.results_logger.compute_and_save()
 
     def validation_step(self, batch: dict, batch_idx: int):
 
