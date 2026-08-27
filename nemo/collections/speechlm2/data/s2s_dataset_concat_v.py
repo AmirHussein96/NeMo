@@ -89,6 +89,7 @@ class DuplexS2SDatasetConcatV(torch.utils.data.Dataset):
                 at positions aligned with audio frames
             - source_token_lens: Tensor of source token sequence lengths [B]
             - target_texts: List of full target texts joined from output_roles supervisions [B]
+            - source_texts: List of full source texts joined from input_roles supervisions [B]
             - lang_prompt: List of raw lang_pair strings per sample (empty string if disabled) [B]
             - prompt_lens: List of prompt lengths in tokens per sample (0 if disabled) [B]
 
@@ -242,6 +243,11 @@ class DuplexS2SDatasetConcatV(torch.utils.data.Dataset):
             "source_token_lens": source_token_lens,
             "target_texts": [
                 " ".join(s.text for s in cut.supervisions if s.speaker in self.output_roles) for cut in cuts
+            ],
+            # Source-language transcript per cut; used as the RNNT loss target for the
+            # auxiliary ASR objective (model.use_rnnt_loss=true).
+            "source_texts": [
+                " ".join(s.text for s in cut.supervisions if s.speaker in self.input_roles) for cut in cuts
             ],
             "first_turn_audio": first_turn_audio,
             "first_turn_audio_lens": first_turn_audio_lens,

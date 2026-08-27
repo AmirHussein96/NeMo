@@ -22,7 +22,9 @@ from safetensors.torch import load_file
 from transformers import AutoConfig, AutoModelForCausalLM
 
 from nemo.collections.asr.models import ASRModel
+from nemo.collections.asr.modules import RNNTDecoder, RNNTJoint
 from nemo.collections.asr.modules.parallel_expert_encoder import ParallelExpertEncoderPT
+from nemo.collections.common.tokenizers.sentencepiece_tokenizer import SentencePieceTokenizer
 from nemo.collections.speechlm2.modules import AudioPerceptionModule
 from nemo.collections.speechlm2.parts.precision import fp32_precision
 from nemo.collections.tts.models import AudioCodecModel
@@ -327,6 +329,132 @@ def setup_speech_encoder(model: torch.nn.Module, pretrained_weights: bool = True
 
     if model.cfg.get("pe_encoder_path", None) not in (None, "", False):
         setup_parallel_expert_encoder(model)
+
+
+def setup_rnnt_decoder_joint(model: torch.nn.Module, model_path_or_name: str = None):
+    """
+    Load an RNNT decoder and joint network from a pretrained NeMo ASR checkpoint (e.g. a
+    ``.nemo`` file or a HuggingFace/NGC name resolvable via ``ASRModel.from_pretrained``).
+    The checkpoint must expose ``decoder``/``joint`` attributes (i.e. an RNNT-based ASR model).
+    The result is assigned to ``model.rnnt_decoder`` and ``model.rnnt_joint``, and (if available)
+    the pretrained ASR's own tokenizer is assigned to ``model.rnnt_tokenizer`` -- used to BPE-encode
+    RNNT loss targets.
+
+    Call this after ``setup_speech_encoder``. The checkpoint can be the same as ``pretrained_asr``
+    or a different one.
+
+    Fast path: if ``model.cfg.pretrained_rnnt_weights`` points to a pre-extracted ``.pt`` bundle
+    (decoder/joint state dicts + configs + tokenizer model path), loads directly without a full
+    NeMo ``restore_from()``/``from_pretrained()``. This avoids the abstract-ASRModel instantiation
+    error that occurs when loading some pretrained checkpoints whose declared model class isn't
+    registered in this NeMo build.
+
+    Slow path (fallback): full ``load_pretrained_nemo(ASRModel, ...)`` via ``model.cfg.pretrained_rnnt_asr``.
+
+    If neither ``model.cfg.pretrained_rnnt_weights`` nor ``model.cfg.pretrained_rnnt_asr`` (nor
+    ``model_path_or_name``) is set, ``model.rnnt_decoder``/``model.rnnt_joint``/``model.rnnt_tokenizer``
+    are set to ``None`` -- callers gate any RNNT-specific loss construction on these being non-``None``.
+    """
+    pretrained_rnnt_weights_path = getattr(model.cfg, 'pretrained_rnnt_weights', None)
+    if pretrained_rnnt_weights_path and Path(pretrained_rnnt_weights_path).exists():
+        logging.info(f"Loading pre-extracted RNNT decoder/joint weights from {pretrained_rnnt_weights_path}")
+        bundle = torch.load(pretrained_rnnt_weights_path, map_location="cpu", weights_only=False)
+        decoder_cfg = OmegaConf.create(bundle["decoder_config"])
+        joint_cfg = OmegaConf.create(bundle["joint_config"])
+        model.rnnt_decoder = RNNTDecoder.from_config_dict(decoder_cfg)
+        model.rnnt_joint = RNNTJoint.from_config_dict(joint_cfg)
+        rnnt_sd = {}
+        for k, v in bundle["state_dict"].items():
+            if k.startswith("decoder."):
+                rnnt_sd["rnnt_decoder." + k[len("decoder."):]] = v
+            elif k.startswith("joint."):
+                rnnt_sd["rnnt_joint." + k[len("joint."):]] = v
+        model.load_state_dict(rnnt_sd, strict=False)
+        tokenizer_model_path = bundle.get("tokenizer_model_path")
+        if tokenizer_model_path and Path(tokenizer_model_path).exists():
+            model.rnnt_tokenizer = SentencePieceTokenizer(model_path=tokenizer_model_path)
+            # A bare SentencePieceTokenizer is missing several attributes that
+            # ASRBPEMixin._setup_monolingual_tokenizer()/_derive_tokenizer_properties() normally
+            # attach, and that RNNTBPEDecoding.__init__ reads unconditionally (vocab_size,
+            # get_vocab, all_special_tokens, supports_capitalization, supported_punctuation).
+            # Patch them on so downstream RNNT BPE decoding utilities work with this tokenizer.
+            vocabulary = {}
+            for i in range(model.rnnt_tokenizer.vocab_size):
+                piece = model.rnnt_tokenizer.ids_to_tokens([i])[0]
+                vocabulary[piece] = i + 1
+
+            def _get_vocab(_vocabulary=vocabulary):
+                return _vocabulary
+
+            model.rnnt_tokenizer.tokenizer.vocab_size = len(vocabulary)
+            model.rnnt_tokenizer.tokenizer.get_vocab = _get_vocab
+            model.rnnt_tokenizer.tokenizer.all_special_tokens = model.rnnt_tokenizer.special_token_to_id
+
+            import unicodedata
+            capitalized_tokens = {token.strip() for token in vocabulary if any(char.isupper() for char in token)}
+            model.rnnt_tokenizer.supports_capitalization = bool(capitalized_tokens)
+            punctuation = {char for token in vocabulary for char in token if unicodedata.category(char).startswith('P')}
+            model.rnnt_tokenizer.supported_punctuation = punctuation
+            logging.info(
+                "Loaded RNNT BPE tokenizer from pre-extracted bundle for RNNT BPE decoding (ids_to_text): %s",
+                tokenizer_model_path,
+            )
+        else:
+            model.rnnt_tokenizer = None
+        return
+
+    path = model_path_or_name
+    if path is None:
+        path = model.cfg.get("pretrained_rnnt_asr", None)
+    if not path:
+        model.rnnt_decoder = None
+        model.rnnt_joint = None
+        model.rnnt_tokenizer = None
+        return
+
+    asr = load_pretrained_nemo(ASRModel, path).eval()
+    if not (hasattr(asr, "decoder") and hasattr(asr, "joint")):
+        logging.warning(
+            "Pretrained ASR at %s has no decoder/joint (got %s). Not loading RNNT head.",
+            path,
+            type(asr).__name__,
+        )
+        model.rnnt_decoder = None
+        model.rnnt_joint = None
+        model.rnnt_tokenizer = None
+        return
+
+    with open_dict(asr.cfg.decoder):
+        if getattr(asr.cfg.decoder, "vocab_size", None) is None and hasattr(asr, "joint"):
+            asr.cfg.decoder.vocab_size = len(asr.joint.vocabulary)
+    with open_dict(asr.cfg.joint):
+        if getattr(asr.cfg.joint, "num_classes", None) is None and hasattr(asr.joint, "vocabulary"):
+            asr.cfg.joint.num_classes = len(asr.joint.vocabulary)
+        if getattr(asr.cfg.joint, "vocabulary", None) is None and hasattr(asr.joint, "vocabulary"):
+            asr.cfg.joint.vocabulary = asr.joint.vocabulary
+    model.rnnt_decoder = type(asr.decoder).from_config_dict(asr.cfg.decoder)
+    model.rnnt_joint = type(asr.joint).from_config_dict(asr.cfg.joint)
+    asr_sd = asr.state_dict()
+    rnnt_sd = {}
+    for k, v in asr_sd.items():
+        if k.startswith("decoder."):
+            rnnt_sd["rnnt_decoder." + k[8:]] = v
+        elif k.startswith("joint."):
+            rnnt_sd["rnnt_joint." + k[6:]] = v
+    model.load_state_dict(rnnt_sd, strict=False)
+    if hasattr(asr, "tokenizer") and asr.tokenizer is not None:
+        model.rnnt_tokenizer = asr.tokenizer
+        logging.info(
+            "Loaded ASR tokenizer from pretrained checkpoint for RNNT BPE decoding (ids_to_text): %s",
+            path,
+        )
+    else:
+        model.rnnt_tokenizer = None
+        logging.info(
+            "Pretrained ASR checkpoint has no tokenizer; RNNT will use vocabulary-only decoding: %s",
+            path,
+        )
+    logging.info("Loaded RNNT decoder and joint from pretrained ASR checkpoint: %s", path)
 
 
 def setup_parallel_expert_encoder(model: torch.nn.Module):

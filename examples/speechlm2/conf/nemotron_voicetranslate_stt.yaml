@@ -1,0 +1,167 @@
+# ============================================================================
+# NemotronVoiceTranslateSTT — Training Configuration
+# ============================================================================
+#
+# Model: NemotronVoiceTranslateSTT (speech-to-text translation, no TTS/audio
+# generation): streaming ASR encoder -> modality_adapter -> pretrained LLM,
+# with optional many-to-many language-direction prompting.
+#
+# Usage (single node, 8 GPUs):
+#   python examples/speechlm2/nemotron_voicetranslate_stt_train.py \
+#       --config-path=examples/speechlm2/conf --config-name=nemotron_voicetranslate_stt \
+#       ++model.pretrained_asr=<path_or_name> \
+#       ++model.pretrained_llm=<path_to_llm_dir> \
+#       ++data.train_ds.input_cfg[0].shar_path=<path> \
+#       exp_manager.explicit_log_dir=<results_dir>
+# ============================================================================
+
+model:
+  pretrained_llm: nvidia/Riva-Translate-4B-Instruct-v1.1
+  pretrained_asr: nvidia/stt_en_fastconformer_hybrid_large_streaming_multi
+  scoring_asr: stt_en_fastconformer_transducer_large  # used only in validation/evaluation
+  source_sample_rate: 16000
+  frame_length: 0.08
+
+  pretrained_weights: true  # When False, uses pretrained_llm to load the architecture, but with random init
+
+  freeze_params: []
+  prevent_freeze_params: []  # Use to make specific submodules trainable; overrides freeze_params
+
+  text_loss_weight: 1.0  # STT model only predicts text, no audio generation
+  duplex_user_channel_weight: 1.0
+  mask_sequence_loss: true
+
+  perception:
+    target: nemo.collections.speechlm2.modules.perception.AudioPerceptionModule
+    preprocessor:
+      normalize: 'NA'
+    encoder:
+      self_attention_model: rel_pos
+      att_context_size: [70, 0]
+      conv_context_size: causal
+      conv_norm_type: layer_norm
+    modality_adapter:
+      _target_: nemo.collections.asr.modules.ConformerEncoder
+      feat_in: 1024
+      feat_out: -1
+      n_layers: 2
+      d_model: 512
+      subsampling: dw_striding
+      subsampling_factor: 1
+      subsampling_conv_channels: 256
+      causal_downsampling: true
+      ff_expansion_factor: 4
+      self_attention_model: rel_pos
+      n_heads: 8
+      att_context_size: [70, 0]
+      att_context_style: chunked_limited
+      xscaling: true
+      untie_biases: true
+      pos_emb_max_len: 5000
+      conv_kernel_size: 9
+      conv_norm_type: layer_norm
+      conv_context_size: causal
+      dropout: 0
+      dropout_pre_encoder: 0
+      dropout_emb: 0.0
+      dropout_att: 0
+    spec_augment:
+      _target_: nemo.collections.asr.modules.SpectrogramAugmentation
+      freq_masks: 2
+      time_masks: 10
+      freq_width: 27
+      time_width: 0.05
+
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 3e-4
+    betas: [0.9, 0.98]
+    weight_decay: 0
+    foreach: true  # set to false if having issues with tensor-parallelism
+
+  lr_scheduler:
+    _target_: nemo.core.optim.lr_scheduler.CosineAnnealing
+    warmup_steps: 2500
+    min_lr: 1e-6
+    max_steps: ${trainer.max_steps}
+
+trainer:
+  devices: -1
+  accelerator: gpu
+  num_nodes: 1
+  precision: bf16-true
+  logger: false  # logger provided by exp_manager
+  enable_checkpointing: false
+  use_distributed_sampler: false
+  max_steps: 1000000
+  limit_train_batches: 1000  # "epoch" size
+  val_check_interval: ${trainer.limit_train_batches}
+  limit_val_batches: 10
+  log_every_n_steps: 10
+  num_sanity_val_steps: 1
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 1
+  strategy:
+    _target_: lightning.pytorch.strategies.DDPStrategy
+    gradient_as_bucket_view: true
+    find_unused_parameters: true
+
+data:
+  frame_length: ${model.frame_length}
+  source_sample_rate: ${model.source_sample_rate}
+  input_roles: ["user", "User"]
+  output_roles: ["agent", "Assistant", "assistant", "Agent"]
+  add_lang_prompt: true
+  lang_map:
+    en: English
+    de: German
+    es: Spanish
+    fr: French
+
+  train_ds:
+    sample_rate: ${data.source_sample_rate}
+    input_cfg:
+      - type: lhotse_shar
+        shar_path: ???
+    seed: 42
+    shard_seed: "randomized"
+    num_workers: 2
+    batch_size: 4
+
+  validation_ds:
+    datasets:
+      val_set_0:  # rename to your dataset name, add more as needed
+        shar_path: ???
+    sample_rate: ${data.source_sample_rate}
+    batch_size: 4
+    seed: 42
+    shard_seed: "randomized"
+
+exp_manager:
+  exp_dir: null
+  explicit_log_dir: nemotron_voicetranslate_stt_results/
+  name: speechlm2
+  create_tensorboard_logger: false
+  create_checkpoint_callback: true
+  use_datetime_version: true
+  max_time_per_run: 00:03:50:00
+
+  resume_from_checkpoint: null
+  resume_if_exists: true
+  resume_ignore_no_checkpoint: true
+
+  create_wandb_logger: false
+  wandb_logger_kwargs:
+    name: development-run
+    project: speechlm2_nemotron_voicetranslate_stt
+    resume: true
+
+  checkpoint_callback_params:
+    filename: "{step}"
+    monitor: val_txt_bleu
+    mode: max
+    every_n_train_steps: null
+    every_n_epochs: 1
+    save_top_k: 1
+    always_save_nemo: false
+    save_nemo_on_train_end: false
