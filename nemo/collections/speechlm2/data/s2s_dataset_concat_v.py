@@ -152,20 +152,42 @@ class DuplexS2SDatasetConcatV(torch.utils.data.Dataset):
         """
         Build a token sequence for a language direction prompt.
 
-        Looks up ``src_lang`` and ``tgt_lang`` (e.g. ``"de"``, ``"es"``) in
-        ``self.lang_map`` and tokenizes:
+        Looks up ``tgt_lang`` (e.g. ``"es"``) in ``self.lang_map`` and tokenizes
+        a hand-written turn that mimics the underlying HF tokenizer's own chat
+        template formatting (``<s>System\\n...</s>\\n<s>Assistant\\n``), so the
+        prompt "looks like" what the pretrained LLM saw during its own
+        instruction tuning, ending right where the assistant turn would start
+        (i.e. right before the audio stream begins).
 
-            <bos> System\\nTranslate from {src_name} to {tgt_name}. <eos>
+        NOTE: we deliberately do NOT call the tokenizer's ``apply_chat_template``
+        here, for two reasons found while debugging a training crash:
+          1) For some tokenizers (e.g. this Mistral-based one),
+             ``apply_chat_template(..., tokenize=True)`` returns a
+             ``BatchEncoding``/dict (with ``input_ids``/``attention_mask``
+             keys) instead of a plain ``List[int]``. Passing that dict
+             straight into ``torch.tensor(...)`` iterates over its string
+             keys and crashes with
+             ``TypeError: 'str' object cannot be interpreted as an integer``.
+          2) Riva-Translate's chat template only recognizes a fixed table of
+             English<->X language-pair codes (e.g. ``"de-en"``) as the system
+             message content; any other content (including free text)
+             silently falls back to the same generic
+             "You are a translation expert." system message for every
+             direction, defeating the purpose of language conditioning.
+        Tokenizing our own text directly avoids both issues. The literal
+        ``<s>``/``</s>`` substrings below are recognized by this tokenizer as
+        the actual BOS/EOS special tokens (verified: they map to the same ids
+        as ``tokenizer.bos``/``tokenizer.eos``, with no duplication), so we
+        don't additionally prepend/append them.
 
-        Falls back to ``<eos>`` only when a code is unknown or missing.
+        Falls back to ``<eos>`` only when a code is unknown/missing.
         """
         try:
-            src_name = self.lang_map.get(src_lang.lower())
             tgt_name = self.lang_map.get(tgt_lang.lower())
-            if src_name is None or tgt_name is None:
-                raise ValueError(f"Unknown language code(s): {src_lang!r}, {tgt_lang!r}")
-            prompt_text = f"System\nTranslate from {src_name} to {tgt_name}."
-            ids = [self.tokenizer.bos] + self.tokenizer.text_to_ids(prompt_text) + [self.tokenizer.eos]
+            if tgt_name is None:
+                raise ValueError(f"Unknown target language code: {tgt_lang!r}")
+            prompt_text = f"<s>System\nYou are an expert at translating to {tgt_name}.</s>\n<s>Assistant\n"
+            ids = self.tokenizer.text_to_ids(prompt_text)
         except Exception as e:
             logging.warning(
                 f"[DuplexS2SDatasetConcatV] Could not build lang prompt for {src_lang!r}->{tgt_lang!r}: {e}. Using EOS only."
