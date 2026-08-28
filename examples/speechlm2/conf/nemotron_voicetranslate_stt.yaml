@@ -129,9 +129,14 @@ data:
     batch_size: 4
 
   validation_ds:
-    datasets:
-      val_set_0:  # rename to your dataset name, add more as needed
-        shar_path: ???
+    # Empty by design: Hydra config composition (`defaults:`) deep-MERGES nested
+    # dicts rather than replacing them, so a placeholder entry here (e.g.
+    # `val_set_0: {shar_path: ???}`) would silently leak into every child config
+    # that adds its own real dataset entries under `datasets`, alongside them,
+    # and crash at validation-dataloader-construction time with
+    # IncompleteConfigError. Child configs are expected to populate this dict
+    # entirely with their own named dataset entries.
+    datasets: {}
     sample_rate: ${data.source_sample_rate}
     batch_size: 4
     seed: 42
