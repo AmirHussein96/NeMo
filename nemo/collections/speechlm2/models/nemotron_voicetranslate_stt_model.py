@@ -668,6 +668,30 @@ class NemotronVoiceTranslateSTT(LightningModule, HFHubMixin):
             if is_frozen(m):
                 m.eval()
 
+        # Multi-lookahead training: when perception.encoder is configured with more than one
+        # att_context_size entry (ConformerEncoder._calc_context_sizes -> self.att_context_size_all),
+        # sample one context per training batch, matching how ConformerEncoder.forward_internal
+        # would sample it natively (`if self.training and len(self.att_context_size_all) > 1`).
+        # We can't rely on that native sampling here: `perception.encoder` was just forced into
+        # `.eval()` above (correct for its frozen dropout/norm semantics), which makes
+        # forward_internal's `self.training` gate False, so it always takes the `else` branch
+        # (fixed `self.att_context_size`) instead of resampling. `set_default_att_context_size`
+        # is ConformerEncoder's own public API for pinning that default (also used by
+        # examples/asr/asr_cache_aware_streaming/speech_to_text_cache_aware_streaming_infer.py);
+        # calling it here writes the sampled context into `self.att_context_size`, which the
+        # `else` branch reads on the very next forward pass. It also calls
+        # `setup_streaming_params()`, which only mutates `self.streaming_cfg` and per-layer
+        # `cache_drop_size` bookkeeping used exclusively by the cache-based streaming forward
+        # path (`cache_last_channel is not None`) -- irrelevant here since `prepare_inputs`
+        # calls `self.perception(...)` without any cache args, so this has no side effect on
+        # the offline forward pass beyond selecting the attention mask context.
+        # Single-context configs (`len(att_context_size_all) == 1`, the pre-existing default)
+        # never enter this branch, so training behaves exactly as before.
+        att_context_size_all = getattr(self.perception.encoder, "att_context_size_all", None)
+        if att_context_size_all is not None and len(att_context_size_all) > 1:
+            sampled_ctx = random.choices(att_context_size_all, weights=self.perception.encoder.att_context_probs)[0]
+            self.perception.encoder.set_default_att_context_size(sampled_ctx)
+
         inputs = self.prepare_inputs(batch)
         forward_outputs = self(inputs["input_embeds"], seq_mask=inputs["seq_mask"])
 
@@ -805,7 +829,11 @@ class NemotronVoiceTranslateSTT(LightningModule, HFHubMixin):
         # Val sees full data on every DDP rank (DataModule); only rank 0 should write shared
         # metadata/WAVs to avoid duplicate rows and parallel truncation on shared filesystems.
         if self.trainer.is_global_zero:
-            self.results_logger = ResultsLogger(self.validation_save_path).reset()
+            # single_rank_writer=True: only rank 0 ever instantiates/updates/computes this
+            # ResultsLogger (other ranks get `None`, see below), so there are no other-rank
+            # result files to poll/merge for and no other rank will ever call
+            # compute_and_save() -- see ResultsLogger.__init__ docstring.
+            self.results_logger = ResultsLogger(self.validation_save_path, single_rank_writer=True).reset()
         else:
             self.results_logger = None
         self.bleu = BLEU().reset()
@@ -818,9 +846,39 @@ class NemotronVoiceTranslateSTT(LightningModule, HFHubMixin):
         self.text_eos_acc = TokenAccuracy(
             token_name="text_eos", token_id=self.text_eos_id, tolerance=tolerance
         ).reset()
+        # Multi-lookahead validation: when perception.encoder has more than one configured
+        # att_context_size, run a separate, explicit per-look-ahead RNNT WER/BLEU pass (see
+        # `_update_multi_context_rnnt_metrics` / `validation_step` below) instead of the single
+        # `self.src_wer`/`self.src_bleu` pair below. Single-context configs are unaffected: this
+        # flag is False, `self._multi_ctx_src_wer`/`_bleu` stay None, and `src_wer`/`src_bleu`
+        # keep their pre-existing names/behavior exactly.
+        self._multi_context_att = (
+            self.rnnt_decoder is not None
+            and getattr(self.perception.encoder, "att_context_size_all", None) is not None
+            and len(self.perception.encoder.att_context_size_all) > 1
+        )
+        self.src_wer = None
+        self.src_bleu = None
+        self._multi_ctx_src_wer = None
+        self._multi_ctx_src_bleu = None
         if self.rnnt_decoder is not None:
-            self.src_wer = WER(verbose=True).reset()
-            self.src_bleu = BLEU().reset()
+            if self._multi_context_att:
+                # Pin a deterministic default context (the first configured one) for the main
+                # `offline_inference` call in `validation_step` below (AST text/BLEU/token-acc
+                # metrics), instead of leaving whatever context training last sampled. The
+                # per-context RNNT WER/BLEU below is computed separately for every context.
+                self.perception.encoder.set_default_att_context_size(self.perception.encoder.att_context_size_all[0])
+                self._multi_ctx_src_wer = {
+                    self._context_suffix(ctx): WER(verbose=False).reset()
+                    for ctx in self.perception.encoder.att_context_size_all
+                }
+                self._multi_ctx_src_bleu = {
+                    self._context_suffix(ctx): BLEU(verbose=False).reset()
+                    for ctx in self.perception.encoder.att_context_size_all
+                }
+            else:
+                self.src_wer = WER(verbose=True).reset()
+                self.src_bleu = BLEU().reset()
 
     def on_validation_epoch_end(self, prefix="val") -> None:
         bleu = self.bleu.compute()
@@ -833,14 +891,62 @@ class NemotronVoiceTranslateSTT(LightningModule, HFHubMixin):
         for k, m in text_eos_acc.items():
             self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
         if self.rnnt_decoder is not None:
-            src_wer = self.src_wer.compute()
-            for k, m in src_wer.items():
-                self.log(f"{prefix}_src_rnnt_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
-            src_bleu = self.src_bleu.compute()
-            for k, m in src_bleu.items():
-                self.log(f"{prefix}_src_rnnt_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+            if self._multi_ctx_src_wer is not None:
+                for suffix, wer_metric in self._multi_ctx_src_wer.items():
+                    src_wer = wer_metric.compute()
+                    for k, m in src_wer.items():
+                        self.log(f"{prefix}_src_rnnt_{k}_{suffix}", m.to(self.device), on_epoch=True, sync_dist=True)
+                for suffix, bleu_metric in self._multi_ctx_src_bleu.items():
+                    src_bleu = bleu_metric.compute()
+                    for k, m in src_bleu.items():
+                        self.log(f"{prefix}_src_rnnt_{k}_{suffix}", m.to(self.device), on_epoch=True, sync_dist=True)
+            else:
+                src_wer = self.src_wer.compute()
+                for k, m in src_wer.items():
+                    self.log(f"{prefix}_src_rnnt_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+                src_bleu = self.src_bleu.compute()
+                for k, m in src_bleu.items():
+                    self.log(f"{prefix}_src_rnnt_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
         if self.results_logger is not None:
             self.results_logger.compute_and_save()
+
+    @staticmethod
+    def _context_suffix(att_context_size) -> str:
+        """e.g. [56, 3] -> 'l56_r3', used to build per-look-ahead metric/log names."""
+        left, right = int(att_context_size[0]), int(att_context_size[1])
+        return f"l{left}_r{right}"
+
+    @torch.no_grad()
+    def _compute_rnnt_asr_hyps(self, dataset_batch: dict):
+        """Lightweight companion to `offline_inference` used only by the multi-look-ahead
+        validation loop: runs `self.perception(...)` (whose output depends on the encoder's
+        *current* att_context_size) and the RNNT greedy decode, skipping the (expensive,
+        context-independent) AST autoregressive text-generation loop entirely -- the RNNT
+        branch never sees prompt/AST frames anyway (see `prepare_inputs`/`offline_inference`
+        comments on `asr_emb`)."""
+        _, lengths, asr_emb = self.perception(
+            input_signal=dataset_batch["source_audio"],
+            input_signal_length=dataset_batch["source_audio_lens"],
+            return_encoder_emb=True,
+        )
+        return self._decode_rnnt_offline(asr_emb, lengths)
+
+    def _update_multi_context_rnnt_metrics(self, name: str, dataset_batch: dict) -> None:
+        """For each configured att_context_size, pin it on the (frozen) perception encoder,
+        recompute the RNNT hypotheses under that context, and update that context's own
+        WER/BLEU accumulator. Restores the epoch's deterministic default context (the first
+        configured one, set in `on_validation_epoch_start`) afterwards so the next dataset's
+        main `offline_inference` call (AST text/BLEU) is unaffected."""
+        encoder = self.perception.encoder
+        default_ctx = encoder.att_context_size_all[0]
+        for ctx in encoder.att_context_size_all:
+            encoder.set_default_att_context_size(ctx)
+            hyps = self._compute_rnnt_asr_hyps(dataset_batch)
+            if hyps is not None:
+                suffix = self._context_suffix(ctx)
+                self._multi_ctx_src_wer[suffix].update(name=name, refs=dataset_batch["source_texts"], hyps=hyps)
+                self._multi_ctx_src_bleu[suffix].update(name=name, refs=dataset_batch["source_texts"], hyps=hyps)
+        encoder.set_default_att_context_size(default_ctx)
 
     def validation_step(self, batch: dict, batch_idx: int):
 
@@ -873,7 +979,9 @@ class NemotronVoiceTranslateSTT(LightningModule, HFHubMixin):
             self.text_bos_acc.update(name=name, refs=dataset_batch["target_tokens"], hyps=results["tokens_text"])
             self.text_eos_acc.update(name=name, refs=dataset_batch["target_tokens"], hyps=results["tokens_text"])
 
-            if src_hyps_rnnt is not None:
+            if self._multi_ctx_src_wer is not None:
+                self._update_multi_context_rnnt_metrics(name, dataset_batch)
+            elif src_hyps_rnnt is not None:
                 self.src_wer.update(name=name, refs=dataset_batch["source_texts"], hyps=src_hyps_rnnt)
                 self.src_bleu.update(name=name, refs=dataset_batch["source_texts"], hyps=src_hyps_rnnt)
 
