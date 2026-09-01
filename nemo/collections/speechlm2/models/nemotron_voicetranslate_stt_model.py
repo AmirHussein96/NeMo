@@ -17,8 +17,9 @@ import tempfile
 
 import torch
 import torch.distributed as dist
+import torch.utils.checkpoint  # used by the optional RNNT-loss activation checkpoint path
 from lightning import LightningModule
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from peft import PeftModel
 from torch import Tensor
 from torch.distributed.fsdp import fully_shard
@@ -43,15 +44,43 @@ from nemo.collections.speechlm2.parts.lora import maybe_install_lora
 from nemo.collections.speechlm2.parts.metrics.bleu import BLEU
 from nemo.collections.speechlm2.parts.metrics.results_logger import ResultsLogger
 from nemo.collections.speechlm2.parts.metrics.token_accuracy import TokenAccuracy
-from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, is_frozen
+from nemo.collections.speechlm2.parts.metrics.wer import WER
+from nemo.collections.speechlm2.parts.optim_setup import (
+    configure_optimizers,
+    is_frozen,
+    snapshot_frozen_param_fingerprints,
+    verify_frozen_params_unchanged,
+)
 from nemo.collections.speechlm2.parts.precision import fp32_precision
 from nemo.collections.speechlm2.parts.pretrained import (
     load_pretrained_hf,
     set_model_dict_for_partial_init,
+    setup_rnnt_decoder_joint,
     setup_speech_encoder,
 )
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, NeuralType
 from nemo.utils import logging
+
+
+def _get_rnnt_loss_class():
+    """Lazy import for the standard NeMo RNNT loss wrapper (warprnnt/numba/pytorch backends
+    auto-resolved). Keeps this module importable on environments without an RNNT loss backend
+    when ``model.use_rnnt_loss`` is unset/false."""
+    from nemo.collections.asr.losses.rnnt import RNNTLoss
+
+    return RNNTLoss
+
+
+def _get_rnnt_decoding_module():
+    """Lazy import for RNNTDecoding and RNNTBPEDecoding (same stack as speech_to_text_streaming_infer)."""
+    from nemo.collections.asr.parts.submodules.rnnt_decoding import (
+        RNNTBPEDecoding,
+        RNNTBPEDecodingConfig,
+        RNNTDecoding,
+        RNNTDecodingConfig,
+    )
+
+    return RNNTDecoding, RNNTDecodingConfig, RNNTBPEDecoding, RNNTBPEDecodingConfig
 
 
 class NemotronVoiceTranslateSTT(LightningModule, HFHubMixin):
@@ -120,6 +149,49 @@ class NemotronVoiceTranslateSTT(LightningModule, HFHubMixin):
 
         # Load the pretrained streaming ASR model and copy its parameters into the audio perception module.
         setup_speech_encoder(self)
+        # Optionally load a pretrained RNNT decoder + joint (set cfg.pretrained_rnnt_asr, or
+        # cfg.pretrained_rnnt_weights for the pre-extracted-bundle fast path). No-op (all three
+        # attributes set to None) when neither config key is set.
+        setup_rnnt_decoder_joint(self)
+
+        # Optional auxiliary RNNT-ASR objective: an additive loss (total = text_loss + rnnt_loss)
+        # trained on source-language transcripts, alongside (not instead of) the existing
+        # translation/text loss. Gated on `use_rnnt_loss` (default False) so this block is a
+        # complete no-op -- no extra module, no extra import -- for every recipe that doesn't
+        # set it.
+        self.rnnt_loss = None
+        if self.cfg.get("use_rnnt_loss", False):
+            if self.rnnt_joint is None or self.rnnt_decoder is None:
+                raise ValueError(
+                    "model.use_rnnt_loss=true requires both rnnt_decoder and rnnt_joint to be "
+                    "loaded; set model.pretrained_rnnt_asr to a NeMo ASR checkpoint exposing "
+                    "decoder+joint (or model.pretrained_rnnt_weights for the pre-extracted bundle)."
+                )
+            if self.rnnt_tokenizer is None:
+                raise ValueError(
+                    "model.use_rnnt_loss=true requires the pretrained ASR checkpoint to ship a "
+                    "tokenizer (needed to BPE-encode batch['source_texts'] into RNNT joint targets)."
+                )
+            # NeMo convention: RNNTLoss(num_classes=...) expects the BLANK index, which equals
+            # vocab_size_without_blank, i.e. num_classes_with_blank - 1 (blank is the last id).
+            blank_idx = self.rnnt_joint.num_classes_with_blank - 1
+            self.rnnt_loss = _get_rnnt_loss_class()(num_classes=blank_idx, reduction='mean_batch')
+            # The joint loaded from the pretrained checkpoint defaults to `_fuse_loss_wer=True`
+            # (NeMo's standard RNNT recipe co-fuses joint+loss+WER for memory). We use the
+            # non-fused path: rnnt_joint(encoder_outputs, decoder_outputs) -> logits, then apply
+            # RNNTLoss separately. Without this, joint.forward() would take the fused branch and
+            # raise "`fuse_loss_wer` flag is set, but `loss` and `wer` modules were not provided!".
+            if hasattr(self.rnnt_joint, "set_fuse_loss_wer"):
+                self.rnnt_joint.set_fuse_loss_wer(False)
+            else:  # very old NeMo with no public setter; fall back to private attribute
+                self.rnnt_joint._fuse_loss_wer = False
+            logging.info(
+                "use_rnnt_loss=True -> constructed RNNTLoss(blank_idx=%d, vocab_with_blank=%d) "
+                "and forced rnnt_joint._fuse_loss_wer=False for non-fused training. "
+                "Set model.rnnt_loss_weight to scale its contribution in training_step.",
+                blank_idx,
+                self.rnnt_joint.num_classes_with_blank,
+            )
 
         if self.cfg.get("pretrained_s2s_model", None):
             self.init_from_model_from_ckpt(self.cfg.pretrained_s2s_model)
@@ -369,11 +441,16 @@ class NemotronVoiceTranslateSTT(LightningModule, HFHubMixin):
                     waveform=batch["source_audio"], sample_rate=self.source_sample_rate, cutoff_freq=cutoff_freq
                 )
         
-        source_encoded, source_encoded_lens, _ = self.perception(
+        source_encoded, source_encoded_lens, asr_emb = self.perception(
             input_signal=batch["source_audio"],
             input_signal_length=batch["source_audio_lens"],
             return_encoder_emb=True,
         )
+        # asr_emb (fed to the auxiliary RNNT ASR head, see training_step) is captured BEFORE
+        # language-prompt embeddings are prepended to source_encoded below: the RNNT objective
+        # transcribes raw source-language acoustic frames only and must not see prompt frames.
+        # asr_emb_lens is cloned from the pre-prepend source_encoded_lens for the same reason.
+        asr_emb_lens = source_encoded_lens.clone()
 
         # Insert language-direction prompt embeddings at the front of source_encoded.
         # Prompt tokens from the dataset are embedded and prepended; actual audio features
@@ -438,13 +515,182 @@ class NemotronVoiceTranslateSTT(LightningModule, HFHubMixin):
             "text_labels": text_labels,
             "seq_mask": seq_mask,
             "loss_scale": loss_scale,
+            "asr_emb": asr_emb,
+            "asr_emb_lens": asr_emb_lens,
         }
 
 
+    def _rnnt_joint_and_loss(
+        self,
+        encoder_outputs,
+        decoder_outputs,
+        targets,
+        encoder_lengths,
+        target_lengths,
+        use_ckpt: bool = False,
+    ):
+        """Compute one rnnt_joint + rnnt_loss pair, with optional activation checkpointing.
+
+        The joint produces a (B, T, U+1, V+1) tensor that RNNTLoss internally upcasts to fp32
+        and whose gradient buffer the numba kernel also allocates at the same shape -- these
+        can be large for multilingual BPE vocabularies. When ``use_ckpt=True``
+        (``model.rnnt_loss_use_checkpoint``), the body runs under
+        ``torch.utils.checkpoint.checkpoint(use_reentrant=False)`` so those tensors are not kept
+        alive by the autograd graph across the rest of ``training_step``.
+        """
+        if use_ckpt:
+            return torch.utils.checkpoint.checkpoint(
+                self._rnnt_joint_and_loss_inner,
+                encoder_outputs,
+                decoder_outputs,
+                targets,
+                encoder_lengths,
+                target_lengths,
+                use_reentrant=False,
+            )
+        return self._rnnt_joint_and_loss_inner(
+            encoder_outputs,
+            decoder_outputs,
+            targets,
+            encoder_lengths,
+            target_lengths,
+        )
+
+    def _rnnt_joint_and_loss_inner(
+        self,
+        encoder_outputs,
+        decoder_outputs,
+        targets,
+        encoder_lengths,
+        target_lengths,
+    ):
+        """Inner body of the RNNT joint+loss path; kept separate so it can be passed
+        to `torch.utils.checkpoint.checkpoint` as a plain callable."""
+        joint_out = self.rnnt_joint(encoder_outputs=encoder_outputs, decoder_outputs=decoder_outputs)
+        return self.rnnt_loss(
+            log_probs=joint_out,
+            targets=targets,
+            input_lengths=encoder_lengths,
+            target_lengths=target_lengths,
+        )
+
+    def _compute_rnnt_loss(self, batch: dict, inputs: dict):
+        """Auxiliary RNNT-ASR loss on source-language transcripts (`batch["source_texts"]`),
+        fed from `inputs["asr_emb"]` (the perception module's ASR-adapter output -- a path
+        separate from the AST `modality_adapter`/LLM path). Returns ``None`` when there is
+        nothing to train on in this batch (e.g. all transcripts empty)."""
+        source_texts = batch.get("source_texts", None)
+        if source_texts is None:
+            raise KeyError(
+                "model.use_rnnt_loss=true but batch is missing 'source_texts'; the data pipeline "
+                "must provide per-cut source-language transcriptions (e.g. s2s_dataset_concat_v.py)."
+            )
+        src_for_rnnt = [(t or "").strip() for t in source_texts]
+        # BPE-encode each source utterance through the RNNT's own tokenizer. Empty transcripts
+        # are excluded -- RNNTLoss requires U >= 1.
+        ids_lists = [self.rnnt_tokenizer.text_to_ids(s) for s in src_for_rnnt]
+        keep_idx = [i for i, ids in enumerate(ids_lists) if len(ids) > 0]
+        if len(keep_idx) == 0:
+            return None
+
+        kept_ids = [ids_lists[i] for i in keep_idx]
+        target_lengths = torch.tensor([len(ids) for ids in kept_ids], device=self.device, dtype=torch.long)
+        max_u = int(target_lengths.max().item())
+        targets = torch.zeros((len(kept_ids), max_u), device=self.device, dtype=torch.long)
+        for i, ids in enumerate(kept_ids):
+            targets[i, : len(ids)] = torch.tensor(ids, device=self.device, dtype=torch.long)
+        keep_t = torch.tensor(keep_idx, device=self.device, dtype=torch.long)
+
+        # inputs["asr_emb"] is (B, T, D); rnnt_joint expects (B, D, T). Pick the non-empty
+        # subset and truncate the time dimension to this sub-batch's actual max length before
+        # the joint (memory optimization: keeps the (B, T, U+1, V+1) joint tensor as small as
+        # the data allows instead of the full padded batch width).
+        sub_emb = inputs["asr_emb"].index_select(0, keep_t)
+        sub_lens = inputs["asr_emb_lens"].index_select(0, keep_t).clamp(min=1, max=sub_emb.shape[1])
+        max_enc_len = int(sub_lens.max().item())
+        if max_enc_len < sub_emb.shape[1]:
+            sub_emb = sub_emb[:, :max_enc_len, :].contiguous()
+        encoder_outputs = sub_emb.transpose(1, 2).contiguous()
+        encoder_lengths = sub_lens
+
+        use_ckpt = bool(self.cfg.get("rnnt_loss_use_checkpoint", False))
+        chunk_size = int(self.cfg.get("rnnt_loss_chunk_size", 0) or 0)
+        n_kept = encoder_outputs.shape[0]
+        if chunk_size <= 0 or chunk_size >= n_kept:
+            decoder_outputs, _, _ = self.rnnt_decoder(targets=targets, target_length=target_lengths)
+            return self._rnnt_joint_and_loss(
+                encoder_outputs=encoder_outputs,
+                decoder_outputs=decoder_outputs,
+                targets=targets,
+                encoder_lengths=encoder_lengths,
+                target_lengths=target_lengths,
+                use_ckpt=use_ckpt,
+            )
+
+        # Chunked path (large batches / long vocab): process the keep-set in chunks and average
+        # per-sample losses so the weight stays comparable to the un-chunked case (RNNTLoss
+        # reduction='mean_batch'). Each chunk is re-truncated to its OWN max lengths (required
+        # for RNNTLoss.certify_inputs correctness, and helpful for memory).
+        chunk_losses = []
+        chunk_sample_counts = []
+        for start in range(0, n_kept, chunk_size):
+            end = min(start + chunk_size, n_kept)
+            c_tgt = targets[start:end]
+            c_tgt_lens = target_lengths[start:end]
+            c_enc = encoder_outputs[start:end]
+            c_enc_lens = encoder_lengths[start:end]
+            c_max_u = int(c_tgt_lens.max().item())
+            if c_max_u < c_tgt.shape[1]:
+                c_tgt = c_tgt[:, :c_max_u].contiguous()
+            c_max_t = int(c_enc_lens.max().item())
+            if c_max_t < c_enc.shape[2]:
+                c_enc = c_enc[:, :, :c_max_t].contiguous()
+            c_dec, _, _ = self.rnnt_decoder(targets=c_tgt, target_length=c_tgt_lens)
+            c_loss = self._rnnt_joint_and_loss(
+                encoder_outputs=c_enc,
+                decoder_outputs=c_dec,
+                targets=c_tgt,
+                encoder_lengths=c_enc_lens,
+                target_lengths=c_tgt_lens,
+                use_ckpt=use_ckpt,
+            )
+            chunk_losses.append(c_loss * (end - start))
+            chunk_sample_counts.append(end - start)
+        return torch.stack(chunk_losses).sum() / float(sum(chunk_sample_counts))
+
     def training_step(self, batch: dict, batch_idx: int):
-        for m in (self.perception.preprocessor, self.perception.encoder, self.llm):
+        modules_to_check = [self.perception.preprocessor, self.perception.encoder, self.llm]
+        if self.rnnt_decoder is not None:
+            modules_to_check.append(self.rnnt_decoder)
+        if self.rnnt_joint is not None:
+            modules_to_check.append(self.rnnt_joint)
+        for m in modules_to_check:
             if is_frozen(m):
                 m.eval()
+
+        # Multi-lookahead training: when perception.encoder is configured with more than one
+        # att_context_size entry (ConformerEncoder._calc_context_sizes -> self.att_context_size_all),
+        # sample one context per training batch, matching how ConformerEncoder.forward_internal
+        # would sample it natively (`if self.training and len(self.att_context_size_all) > 1`).
+        # We can't rely on that native sampling here: `perception.encoder` was just forced into
+        # `.eval()` above (correct for its frozen dropout/norm semantics), which makes
+        # forward_internal's `self.training` gate False, so it always takes the `else` branch
+        # (fixed `self.att_context_size`) instead of resampling. `set_default_att_context_size`
+        # is ConformerEncoder's own public API for pinning that default (also used by
+        # examples/asr/asr_cache_aware_streaming/speech_to_text_cache_aware_streaming_infer.py);
+        # calling it here writes the sampled context into `self.att_context_size`, which the
+        # `else` branch reads on the very next forward pass. It also calls
+        # `setup_streaming_params()`, which only mutates `self.streaming_cfg` and per-layer
+        # `cache_drop_size` bookkeeping used exclusively by the cache-based streaming forward
+        # path (`cache_last_channel is not None`) -- irrelevant here since `prepare_inputs`
+        # calls `self.perception(...)` without any cache args, so this has no side effect on
+        # the offline forward pass beyond selecting the attention mask context.
+        # Single-context configs (`len(att_context_size_all) == 1`, the pre-existing default)
+        # never enter this branch, so training behaves exactly as before.
+        att_context_size_all = getattr(self.perception.encoder, "att_context_size_all", None)
+        if att_context_size_all is not None and len(att_context_size_all) > 1:
+            sampled_ctx = random.choices(att_context_size_all, weights=self.perception.encoder.att_context_probs)[0]
+            self.perception.encoder.set_default_att_context_size(sampled_ctx)
 
         inputs = self.prepare_inputs(batch)
         forward_outputs = self(inputs["input_embeds"], seq_mask=inputs["seq_mask"])
@@ -466,6 +712,18 @@ class NemotronVoiceTranslateSTT(LightningModule, HFHubMixin):
 
         loss = self.cfg.text_loss_weight * text_loss
 
+        # ---- Optional auxiliary RNNT-ASR loss --------------------------------------------
+        # Additive: total_loss = text_loss_weight * text_loss + rnnt_loss_weight * rnnt_loss.
+        # Gated on `use_rnnt_loss` (default False): when unset this block is a complete no-op,
+        # so existing translation-only recipes are unaffected. Preserves the existing
+        # translation/text loss and language-prompting behavior -- this does not replace them.
+        rnnt_loss_val = None
+        if self.cfg.get("use_rnnt_loss", False) and self.rnnt_loss is not None:
+            rnnt_loss_val = self._compute_rnnt_loss(batch, inputs)
+            if rnnt_loss_val is not None:
+                loss = loss + self.cfg.get("rnnt_loss_weight", 1.0) * rnnt_loss_val
+        # -----------------------------------------------------------------------------------
+
         B, T = inputs["input_embeds"].shape[:2]
         ans = {
             "loss": loss,
@@ -476,6 +734,8 @@ class NemotronVoiceTranslateSTT(LightningModule, HFHubMixin):
             "num_frames": num_frames.to(torch.float32),
             "padding_ratio": num_frames / (B * T),
         }
+        if rnnt_loss_val is not None:
+            ans["rnnt_loss"] = rnnt_loss_val
 
         self.log("batch_size", B, on_step=True, prog_bar=True, logger=True)
         self.log("sequence_length", T, on_step=True, prog_bar=True, logger=True)
@@ -486,9 +746,96 @@ class NemotronVoiceTranslateSTT(LightningModule, HFHubMixin):
     def on_train_epoch_start(self) -> None:
         pass
 
+    def _get_rnnt_decoding(self):
+        """Lazy-build and cache NeMo RNNT greedy decoding for validation-time transcription
+        of the source-language audio (asr_adapter -> rnnt_decoder -> rnnt_joint). Purely an
+        eval-time utility: does not affect training_step, the RNNT loss, or any trainable
+        parameter. Returns ``None`` when the RNNT branch isn't configured
+        (``model.use_rnnt_loss``/``pretrained_rnnt_asr`` unset), matching training's own gating.
+        """
+        if getattr(self, "_rnnt_decoding", None) is not None:
+            return self._rnnt_decoding
+        if getattr(self, "rnnt_decoder", None) is None or getattr(self, "rnnt_joint", None) is None:
+            return None
+        (
+            RNNTDecoding,
+            RNNTDecodingConfig,
+            RNNTBPEDecoding,
+            RNNTBPEDecodingConfig,
+        ) = _get_rnnt_decoding_module()
+        decoding_cfg = OmegaConf.structured(RNNTBPEDecodingConfig())
+        decoding_cfg.strategy = "greedy"
+        decoding_cfg.greedy.max_symbols_per_step = self.cfg.get("rnnt_max_symbols_per_step", 10)
+        tokenizer = getattr(self, "rnnt_tokenizer", None)
+        if tokenizer is not None:
+            self._rnnt_decoding = RNNTBPEDecoding(
+                decoding_cfg=decoding_cfg,
+                decoder=self.rnnt_decoder,
+                joint=self.rnnt_joint,
+                tokenizer=tokenizer,
+            )
+            logging.info("Using RNNTBPEDecoding with ASR tokenizer (ids_to_text) for validation-time RNNT WER.")
+        else:
+            vocab = getattr(self.rnnt_joint, "vocabulary", None)
+            if vocab is None:
+                logging.warning("rnnt_joint has no vocabulary; cannot build RNNT decoding for validation.")
+                return None
+            decoding_cfg_v = OmegaConf.structured(RNNTDecodingConfig())
+            decoding_cfg_v.strategy = "greedy"
+            decoding_cfg_v.greedy.max_symbols_per_step = self.cfg.get("rnnt_max_symbols_per_step", 10)
+            self._rnnt_decoding = RNNTDecoding(
+                decoding_cfg=decoding_cfg_v,
+                decoder=self.rnnt_decoder,
+                joint=self.rnnt_joint,
+                vocabulary=list(vocab),
+            )
+            logging.info("Using RNNTDecoding with vocabulary (no tokenizer) for validation-time RNNT WER.")
+        return self._rnnt_decoding
+
+    @staticmethod
+    def _rnnt_hypotheses_to_src_text(hypotheses: list) -> list:
+        """Convert RNNT Hypothesis objects to transcript strings. Normalizes the SentencePiece
+        ``▁`` (U+2581) word-boundary marker to a space; BCP-47 language tags the multilingual
+        RNNT vocabulary may emit (e.g. ``<fr-FR>``) are intentionally kept for observability --
+        WER scoring strips them via the metric's own text normalizer."""
+        import re
+
+        texts = []
+        for hyp in hypotheses:
+            raw = str(getattr(hyp, "text", "") or "").strip()
+            raw = raw.replace("▁", " ")
+            raw = re.sub(r" +", " ", raw).strip()
+            raw = re.sub(r"(\s+)([.,?])", r"\2", raw)
+            texts.append(raw)
+        return texts
+
+    def _decode_rnnt_offline(self, asr_emb: torch.Tensor, asr_emb_lens: torch.Tensor):
+        """Full-utterance (non-streaming) greedy RNNT decode of ``asr_emb`` -> list[str], one
+        transcript per batch item. Returns ``None`` when the RNNT branch isn't configured."""
+        decoding = self._get_rnnt_decoding()
+        if decoding is None:
+            return None
+        encoder_output = asr_emb.transpose(1, 2).contiguous()  # (B, D, T)
+        with torch.inference_mode():
+            hypotheses = decoding.rnnt_decoder_predictions_tensor(
+                encoder_output=encoder_output,
+                encoded_lengths=asr_emb_lens,
+                return_hypotheses=True,
+            )
+        return self._rnnt_hypotheses_to_src_text(hypotheses)
+
     def on_validation_epoch_start(self) -> None:
         self.on_train_epoch_start()
-        self.results_logger = ResultsLogger(self.validation_save_path).reset()
+        # Val sees full data on every DDP rank (DataModule); only rank 0 should write shared
+        # metadata/WAVs to avoid duplicate rows and parallel truncation on shared filesystems.
+        if self.trainer.is_global_zero:
+            # single_rank_writer=True: only rank 0 ever instantiates/updates/computes this
+            # ResultsLogger (other ranks get `None`, see below), so there are no other-rank
+            # result files to poll/merge for and no other rank will ever call
+            # compute_and_save() -- see ResultsLogger.__init__ docstring.
+            self.results_logger = ResultsLogger(self.validation_save_path, single_rank_writer=True).reset()
+        else:
+            self.results_logger = None
         self.bleu = BLEU().reset()
         tolerance = int(
             self.cfg.get("val_acc_tolerance", 160) / (1000 / self.source_fps)
@@ -499,6 +846,39 @@ class NemotronVoiceTranslateSTT(LightningModule, HFHubMixin):
         self.text_eos_acc = TokenAccuracy(
             token_name="text_eos", token_id=self.text_eos_id, tolerance=tolerance
         ).reset()
+        # Multi-lookahead validation: when perception.encoder has more than one configured
+        # att_context_size, run a separate, explicit per-look-ahead RNNT WER/BLEU pass (see
+        # `_update_multi_context_rnnt_metrics` / `validation_step` below) instead of the single
+        # `self.src_wer`/`self.src_bleu` pair below. Single-context configs are unaffected: this
+        # flag is False, `self._multi_ctx_src_wer`/`_bleu` stay None, and `src_wer`/`src_bleu`
+        # keep their pre-existing names/behavior exactly.
+        self._multi_context_att = (
+            self.rnnt_decoder is not None
+            and getattr(self.perception.encoder, "att_context_size_all", None) is not None
+            and len(self.perception.encoder.att_context_size_all) > 1
+        )
+        self.src_wer = None
+        self.src_bleu = None
+        self._multi_ctx_src_wer = None
+        self._multi_ctx_src_bleu = None
+        if self.rnnt_decoder is not None:
+            if self._multi_context_att:
+                # Pin a deterministic default context (the first configured one) for the main
+                # `offline_inference` call in `validation_step` below (AST text/BLEU/token-acc
+                # metrics), instead of leaving whatever context training last sampled. The
+                # per-context RNNT WER/BLEU below is computed separately for every context.
+                self.perception.encoder.set_default_att_context_size(self.perception.encoder.att_context_size_all[0])
+                self._multi_ctx_src_wer = {
+                    self._context_suffix(ctx): WER(verbose=False).reset()
+                    for ctx in self.perception.encoder.att_context_size_all
+                }
+                self._multi_ctx_src_bleu = {
+                    self._context_suffix(ctx): BLEU(verbose=False).reset()
+                    for ctx in self.perception.encoder.att_context_size_all
+                }
+            else:
+                self.src_wer = WER(verbose=True).reset()
+                self.src_bleu = BLEU().reset()
 
     def on_validation_epoch_end(self, prefix="val") -> None:
         bleu = self.bleu.compute()
@@ -510,7 +890,63 @@ class NemotronVoiceTranslateSTT(LightningModule, HFHubMixin):
         text_eos_acc = self.text_eos_acc.compute()
         for k, m in text_eos_acc.items():
             self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
-        self.results_logger.compute_and_save()
+        if self.rnnt_decoder is not None:
+            if self._multi_ctx_src_wer is not None:
+                for suffix, wer_metric in self._multi_ctx_src_wer.items():
+                    src_wer = wer_metric.compute()
+                    for k, m in src_wer.items():
+                        self.log(f"{prefix}_src_rnnt_{k}_{suffix}", m.to(self.device), on_epoch=True, sync_dist=True)
+                for suffix, bleu_metric in self._multi_ctx_src_bleu.items():
+                    src_bleu = bleu_metric.compute()
+                    for k, m in src_bleu.items():
+                        self.log(f"{prefix}_src_rnnt_{k}_{suffix}", m.to(self.device), on_epoch=True, sync_dist=True)
+            else:
+                src_wer = self.src_wer.compute()
+                for k, m in src_wer.items():
+                    self.log(f"{prefix}_src_rnnt_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+                src_bleu = self.src_bleu.compute()
+                for k, m in src_bleu.items():
+                    self.log(f"{prefix}_src_rnnt_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+        if self.results_logger is not None:
+            self.results_logger.compute_and_save()
+
+    @staticmethod
+    def _context_suffix(att_context_size) -> str:
+        """e.g. [56, 3] -> 'l56_r3', used to build per-look-ahead metric/log names."""
+        left, right = int(att_context_size[0]), int(att_context_size[1])
+        return f"l{left}_r{right}"
+
+    @torch.no_grad()
+    def _compute_rnnt_asr_hyps(self, dataset_batch: dict):
+        """Lightweight companion to `offline_inference` used only by the multi-look-ahead
+        validation loop: runs `self.perception(...)` (whose output depends on the encoder's
+        *current* att_context_size) and the RNNT greedy decode, skipping the (expensive,
+        context-independent) AST autoregressive text-generation loop entirely -- the RNNT
+        branch never sees prompt/AST frames anyway (see `prepare_inputs`/`offline_inference`
+        comments on `asr_emb`)."""
+        _, lengths, asr_emb = self.perception(
+            input_signal=dataset_batch["source_audio"],
+            input_signal_length=dataset_batch["source_audio_lens"],
+            return_encoder_emb=True,
+        )
+        return self._decode_rnnt_offline(asr_emb, lengths)
+
+    def _update_multi_context_rnnt_metrics(self, name: str, dataset_batch: dict) -> None:
+        """For each configured att_context_size, pin it on the (frozen) perception encoder,
+        recompute the RNNT hypotheses under that context, and update that context's own
+        WER/BLEU accumulator. Restores the epoch's deterministic default context (the first
+        configured one, set in `on_validation_epoch_start`) afterwards so the next dataset's
+        main `offline_inference` call (AST text/BLEU) is unaffected."""
+        encoder = self.perception.encoder
+        default_ctx = encoder.att_context_size_all[0]
+        for ctx in encoder.att_context_size_all:
+            encoder.set_default_att_context_size(ctx)
+            hyps = self._compute_rnnt_asr_hyps(dataset_batch)
+            if hyps is not None:
+                suffix = self._context_suffix(ctx)
+                self._multi_ctx_src_wer[suffix].update(name=name, refs=dataset_batch["source_texts"], hyps=hyps)
+                self._multi_ctx_src_bleu[suffix].update(name=name, refs=dataset_batch["source_texts"], hyps=hyps)
+        encoder.set_default_att_context_size(default_ctx)
 
     def validation_step(self, batch: dict, batch_idx: int):
 
@@ -519,25 +955,35 @@ class NemotronVoiceTranslateSTT(LightningModule, HFHubMixin):
                 continue  # some dataset is exhausted
 
             results = self.offline_inference(dataset_batch)
+            src_hyps_rnnt = results.get("src_text_rnnt")
 
-            self.results_logger.update(
-                name=name,
-                refs=dataset_batch["target_texts"],
-                hyps=results["text"],
-                asr_hyps=None,
-                samples_id=dataset_batch['sample_id'],
-                pred_audio=None,
-                pred_audio_sr=self.source_sample_rate,
-                user_audio=dataset_batch["source_audio"],
-                user_audio_sr=self.source_sample_rate,
-                fps=self.source_fps,
-                results=results if self.cfg.get("dump_tokens_text", False) else None,
-                tokenizer=self.tokenizer,
-            )
+            if self.results_logger is not None:
+                self.results_logger.update(
+                    name=name,
+                    refs=dataset_batch["target_texts"],
+                    hyps=results["text"],
+                    asr_hyps=None,
+                    samples_id=dataset_batch['sample_id'],
+                    pred_audio=None,
+                    pred_audio_sr=self.source_sample_rate,
+                    user_audio=dataset_batch["source_audio"],
+                    user_audio_sr=self.source_sample_rate,
+                    fps=self.source_fps,
+                    results=results if self.cfg.get("dump_tokens_text", False) else None,
+                    tokenizer=self.tokenizer,
+                    src_refs=dataset_batch.get("source_texts") if src_hyps_rnnt is not None else None,
+                    src_hyps=src_hyps_rnnt,
+                )
 
             self.bleu.update(name=name, refs=dataset_batch["target_texts"], hyps=results["text"])
             self.text_bos_acc.update(name=name, refs=dataset_batch["target_tokens"], hyps=results["tokens_text"])
             self.text_eos_acc.update(name=name, refs=dataset_batch["target_tokens"], hyps=results["tokens_text"])
+
+            if self._multi_ctx_src_wer is not None:
+                self._update_multi_context_rnnt_metrics(name, dataset_batch)
+            elif src_hyps_rnnt is not None:
+                self.src_wer.update(name=name, refs=dataset_batch["source_texts"], hyps=src_hyps_rnnt)
+                self.src_bleu.update(name=name, refs=dataset_batch["source_texts"], hyps=src_hyps_rnnt)
 
     def on_test_epoch_start(self) -> None:
         return self.on_validation_epoch_start()
@@ -583,9 +1029,13 @@ class NemotronVoiceTranslateSTT(LightningModule, HFHubMixin):
             input_signal = _resample(input_signal, sr, self.source_sample_rate)
             input_signal_lens = torch.tensor([input_signal.size(-1)]).to(device)
 
-        source_encoded, lengths, _ = self.perception(
+        source_encoded, lengths, asr_emb = self.perception(
             input_signal=input_signal, input_signal_length=input_signal_lens, return_encoder_emb=True
         )
+        # asr_emb_lens is captured BEFORE the prompt-prefix loop below mutates `lengths` in
+        # place (same reasoning as prepare_inputs/training_step): the RNNT branch transcribes
+        # raw source-language acoustic frames only and must not see prompt frames.
+        asr_emb_lens = lengths.clone()
         B, T_local, H = source_encoded.shape
 
         # ── Insert prompt embeddings (DuplexSTT-style) ──────────────────────────
@@ -692,6 +1142,10 @@ class NemotronVoiceTranslateSTT(LightningModule, HFHubMixin):
             "text": tokens_to_str(gen_text, gen_text_len, tokenizer=self.tokenizer, pad_id=self.text_pad_id),
             "tokens_text": gen_text,
             "tokens_len": dataset_batch["decode_source_audio_lens"],
+            # Validation-time-only RNNT greedy decode (asr_adapter -> rnnt_decoder -> rnnt_joint)
+            # of the source-language audio. None when the RNNT branch isn't configured. This does
+            # not affect the AST/translation prediction above or any training behavior.
+            "src_text_rnnt": self._decode_rnnt_offline(asr_emb, asr_emb_lens),
         }
 
         if self.cfg.get("custom_sample_inference", None):
@@ -703,7 +1157,61 @@ class NemotronVoiceTranslateSTT(LightningModule, HFHubMixin):
             super().backward(*args, **kwargs)
 
     def configure_optimizers(self):
-        return configure_optimizers(self)
+        result = configure_optimizers(self)
+        n_trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        n_frozen = sum(p.numel() for p in self.parameters() if not p.requires_grad)
+        logging.info(
+            "Parameter budget — trainable: %s (%.1f M)  frozen: %s (%.1f M)",
+            f"{n_trainable:,}",
+            n_trainable / 1e6,
+            f"{n_frozen:,}",
+            n_frozen / 1e6,
+        )
+        return result
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        """
+        Snapshot frozen-parameter fingerprints for `on_save_checkpoint`'s integrity check,
+        once (after the first optimizer step of this run/resume). Not done in
+        `configure_optimizers()`: the strategy (DDP/FSDP) may still perform one-time
+        parameter/buffer broadcasts or device/precision materialization after that point,
+        which would make an earlier snapshot look like spurious "drift" at the first save.
+        """
+        if getattr(self, "_frozen_param_fingerprints", None) is None and self.trainer is not None:
+            self._frozen_param_fingerprints = snapshot_frozen_param_fingerprints(self)
+            logging.info(
+                f"Frozen-parameter integrity snapshot recorded for {len(self._frozen_param_fingerprints)} "
+                f"parameter tensor(s) after step {self.trainer.global_step}; will be re-checked before "
+                "every checkpoint save."
+            )
+
+    def on_save_checkpoint(self, checkpoint):
+        """
+        Integrity check: every parameter marked frozen (requires_grad=False) by
+        `configure_optimizers` must still be bit-for-bit identical to its value at the start
+        of this run/resume. Runs on every checkpoint save. Raises loudly rather than silently
+        persisting a checkpoint with corrupted "frozen" weights (see model.freeze_params).
+        """
+        fingerprints = getattr(self, "_frozen_param_fingerprints", None)
+        if not fingerprints:
+            return  # configure_optimizers()/first training step haven't run yet.
+        drifted = verify_frozen_params_unchanged(self, fingerprints)
+        if drifted:
+            msg = (
+                f"Frozen-parameter integrity check FAILED before checkpoint save at "
+                f"global_step={self.trainer.global_step if self.trainer is not None else '?'}: "
+                f"{len(drifted)} parameter(s) that should be frozen (per model.freeze_params) "
+                f"have changed value since training started. Refusing to save -- this checkpoint's "
+                f"frozen submodules (e.g. llm, perception.encoder) can no longer be trusted to "
+                f"match their intended pretrained/frozen state."
+            )
+            if os.environ.get("FROZEN_PARAM_CHECK_NONFATAL", "0") == "1":
+                # DIAGNOSTIC-ONLY escape hatch: log the FULL drifted list and continue instead
+                # of raising, so a live repro run can keep going past the first checkpoint save.
+                logging.error(msg)
+                logging.error(f"[frozen-param-check] FULL drifted list ({len(drifted)}): {drifted}")
+            else:
+                raise RuntimeError(msg)
 
     @property
     def oomptimizer_schema(self) -> dict:

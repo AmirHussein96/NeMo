@@ -1,0 +1,88 @@
+# ============================================================================
+# NemotronVoiceTranslateSTT + auxiliary RNNT-ASR adapter — Training Configuration
+# ============================================================================
+#
+# Extends nemotron_voicetranslate_stt.yaml (Amir's translation/text-loss recipe,
+# left unchanged) with an ADDITIVE auxiliary RNNT-ASR objective:
+#
+#     total_loss = text_loss_weight * text_loss + rnnt_loss_weight * rnnt_loss
+#
+# The RNNT branch trains a small, randomly-initialized 2-layer causal Conformer
+# "ASR adapter" (perception.asr_adapter) on the RAW encoder output (i.e. the
+# perception module's `encoder_emb` tap point, BEFORE the AST `modality_adapter`),
+# feeding a pretrained RNNT decoder+joint. It does not replace or route through the
+# AST/translation path -- that path (modality_adapter -> LLM) is untouched.
+#
+# Usage (single node, 8 GPUs):
+#   python examples/speechlm2/nemotron_voicetranslate_stt_train.py \
+#       --config-path=examples/speechlm2/conf \
+#       --config-name=nemotron_voicetranslate_stt_rnnt_asr_adapter \
+#       ++model.pretrained_asr=<path_or_name> \
+#       ++model.pretrained_llm=<path_to_llm_dir> \
+#       ++model.pretrained_rnnt_asr=<path_to_rnnt_asr.nemo_or_name> \
+#       ++data.train_ds.input_cfg[0].shar_path=<path> \
+#       exp_manager.explicit_log_dir=<results_dir>
+# ============================================================================
+
+defaults:
+  - nemotron_voicetranslate_stt
+  - _self_
+
+model:
+  # RNNT decoder+joint (and its BPE tokenizer, used to encode `source_texts` targets) are
+  # loaded from this pretrained ASR checkpoint. May be the same checkpoint as
+  # `pretrained_asr` above, or a different (e.g. multilingual streaming RNNT) one.
+  # Alternatively set `pretrained_rnnt_weights` to a pre-extracted .pt bundle path
+  # (see nemo/collections/speechlm2/parts/pretrained.py:setup_rnnt_decoder_joint).
+  pretrained_rnnt_asr: ???
+
+  use_rnnt_loss: true
+  rnnt_loss_weight: 1.0
+  # Memory-optimization knobs for the RNNT joint+loss on large BPE vocabularies; both
+  # default off/no-op and only take effect together (chunk_size > 0 requires the checkpoint
+  # wrapper to actually free memory between chunks).
+  rnnt_loss_use_checkpoint: false
+  rnnt_loss_chunk_size: 0
+
+  # 2-layer causal Conformer ASR adapter: randomly initialized, trainable, consumes the raw
+  # (pre-modality_adapter) encoder output and feeds the RNNT decoder+joint. Independent of
+  # `modality_adapter` above (used only by the AST/translation path).
+  perception:
+    asr_adapter:
+      _target_: nemo.collections.asr.modules.ConformerEncoder
+      feat_in: 1024
+      feat_out: 1024
+      n_layers: 2
+      d_model: 512
+      subsampling: dw_striding
+      subsampling_factor: 1  # no time compression -- RNNT needs dense frames
+      subsampling_conv_channels: 256
+      causal_downsampling: true
+      ff_expansion_factor: 4
+      self_attention_model: rel_pos
+      n_heads: 8
+      att_context_size: [70, 0]  # causal streaming, matches perception.encoder
+      att_context_style: chunked_limited
+      xscaling: true
+      untie_biases: true
+      pos_emb_max_len: 5000
+      conv_kernel_size: 9
+      conv_norm_type: layer_norm
+      conv_context_size: causal
+      dropout: 0
+      dropout_pre_encoder: 0
+      dropout_emb: 0.0
+      dropout_att: 0
+
+  # Freeze everything except the new ASR adapter + RNNT decoder/joint, so the RNNT
+  # objective trains as a genuinely auxiliary head and cannot perturb the (pretrained)
+  # translation path. Adjust/extend if you also want to fine-tune the encoder, etc.
+  freeze_params:
+    - "^perception\\.encoder\\..+$"
+    - "^perception\\.modality_adapter\\..+$"
+    - "^perception\\.proj\\..+$"
+    - "^llm\\..+$"
+    - "^lm_head\\..+$"
+    - "^embed_tokens\\..+$"
+    # perception.asr_adapter, rnnt_decoder, rnnt_joint are intentionally NOT listed here
+    # (left trainable).

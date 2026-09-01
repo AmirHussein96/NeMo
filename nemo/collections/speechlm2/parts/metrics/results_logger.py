@@ -80,8 +80,24 @@ class ResultsLogger:
     Now supports distributed training with result merging across ranks.
     """
 
-    def __init__(self, save_path):
+    def __init__(self, save_path, single_rank_writer: bool = False):
+        """
+        Args:
+            save_path: directory to save audio/metadata outputs to.
+            single_rank_writer: set True when the *caller* only ever instantiates/updates/
+                calls compute_and_save() on this ResultsLogger from global rank 0 (e.g. because
+                validation data is fully replicated across DDP ranks, so only rank 0 needs to
+                log to avoid duplicate rows). In that case there are no other-rank result files
+                to wait for or merge, and rank 0 is the *only* rank that will ever call
+                compute_and_save(), so the cross-rank barrier/broadcast collectives (which
+                require participation from every rank in the process group) must also be
+                skipped -- calling them from a single rank would hang. Default False preserves
+                the original behavior for callers (e.g. DuplexSTTModel) that genuinely call
+                update()/compute_and_save() from every DDP rank and rely on the rank-file
+                merge to gather results.
+        """
         self.save_path = save_path
+        self.single_rank_writer = single_rank_writer
         self.audio_save_path = os.path.join(save_path, "pred_wavs")
         os.makedirs(self.audio_save_path, exist_ok=True)
         self.metadata_save_path = os.path.join(save_path, "metadatas")
@@ -373,8 +389,16 @@ class ResultsLogger:
                 rank_json_path = os.path.join(self.metadata_save_path, f"{name}_rank{rank}.json")
             logging.info(f"Rank {rank} metadata file for {name} dataset saved at: {rank_json_path}")
 
-        # Step 2: Synchronize all ranks before merging
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
+        # Step 2: Synchronize all ranks before merging.
+        # Skipped for single_rank_writer callers: only rank 0 ever calls compute_and_save()
+        # for them (other ranks never instantiate a ResultsLogger / never reach this method
+        # at all), so a collective barrier here -- which requires every rank in the process
+        # group to call it -- would hang forever rather than synchronize anything.
+        if (
+            not self.single_rank_writer
+            and torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        ):
             torch.distributed.barrier()
 
         # Step 3: Only rank 0 merges all results and computes final metrics.
@@ -391,8 +415,17 @@ class ResultsLogger:
             all_names = disk_names if disk_names else set(self.cached_results.keys())
 
             for name in sorted(all_names):
-                # Merge results from all ranks
-                merged_results = self._merge_rank_files(name)
+                if self.single_rank_writer:
+                    # No other rank ever writes a `{name}_rank{r}.json` file for this caller
+                    # (by design -- see __init__ docstring), so there is nothing to wait for
+                    # or merge: rank 0's own already-complete in-memory results *are* the
+                    # final results. Skip the cross-rank poll/merge entirely instead of
+                    # waiting up to `max_wait` seconds per rank (x world_size) for files that
+                    # will never appear.
+                    merged_results = self.cached_results.get(name, [])
+                else:
+                    # Merge results from all ranks
+                    merged_results = self._merge_rank_files(name)
 
                 # Save merged results
                 final_json_path = os.path.join(self.metadata_save_path, f"{name}.json")
@@ -476,8 +509,16 @@ class ResultsLogger:
                 elif name in mcq_subset_names and not self.mcq_evaluator:
                     logging.warning(f"MCQ evaluator not initialized, skipping MCQ evaluation for '{name}'")
 
-        # Step 4: Broadcast metrics from rank 0 to all other ranks
-        if torch.distributed.is_available() and torch.distributed.is_initialized() and world_size > 1:
+        # Step 4: Broadcast metrics from rank 0 to all other ranks.
+        # Skipped for single_rank_writer callers for the same reason as the Step 2 barrier:
+        # no other rank ever calls compute_and_save() for them, so a collective broadcast
+        # here has no other-rank participant and would hang.
+        if (
+            not self.single_rank_writer
+            and torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            and world_size > 1
+        ):
             # Convert metrics to a format that can be broadcasted
             if rank == 0:
                 metrics_to_broadcast = {}

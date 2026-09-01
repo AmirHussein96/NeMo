@@ -90,6 +90,13 @@ class AudioPerceptionModule(NeuralModule, Exportable):
         # Optional Rotary Time Embedding (ROTE), applied to the encoder output features
         # at the entrance of the modality adapter. ``None`` (default) is a no-op.
         self.rote = self.from_config_dict(cfg.rote) if cfg.get("rote") is not None else None
+        # Optional ASR-specific adapter (e.g. a small causal Conformer) that transforms the
+        # raw, pre-modality_adapter encoder output into a representation fed to an auxiliary
+        # RNNT ASR head. Kept separate from the AST `modality_adapter` path -- both branch off
+        # the same `encoder_emb` tap point below. Only exercised when return_encoder_emb=True.
+        self.asr_adapter = None
+        if cfg.get('asr_adapter') is not None:
+            self.asr_adapter = self.from_config_dict(cfg.asr_adapter)
 
     def set_activation_checkpointing(self, enabled: bool) -> None:
         """Enable/disable activation checkpointing on the encoder's transformer layers.
@@ -193,6 +200,12 @@ class AudioPerceptionModule(NeuralModule, Exportable):
         # b, c, t -> b, t, c
         encoded = self.proj(encoded.transpose(1, 2))
         if return_encoder_emb:
+            if self.asr_adapter is not None:
+                # Route the raw encoder output through the ASR-specific adapter instead of
+                # returning it as-is. encoder_emb/asr_enc are (B, D, T); encoded_len is
+                # unchanged since both the encoder and the ASR adapter use subsampling_factor=1.
+                asr_enc, _ = self.asr_adapter(audio_signal=encoder_emb, length=encoded_len)
+                return encoded, encoded_len, asr_enc.transpose(1, 2)
             return encoded, encoded_len, encoder_emb.transpose(1, 2)
         else:
             return encoded, encoded_len
