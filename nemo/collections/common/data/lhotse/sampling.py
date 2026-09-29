@@ -288,6 +288,21 @@ class ValidationStatusFilter:
             return True
 
 
+class SkipmeFilter:
+    """
+    Callable, returns ``False`` if a cut's ``custom["_skipme"]`` is truthy and ``True`` otherwise.
+    Acts as a pass-through for objects of other type than Cut.
+    """
+
+    def __init__(self, enabled: bool = True) -> None:
+        self.enabled = enabled
+
+    def __call__(self, example) -> bool:
+        if not self.enabled or not isinstance(example, MonoCut):
+            return True
+        return not (example.custom or {}).get("_skipme", False)
+
+
 class CERFilter:
     """
     Callable, returns ``True`` if a cut's CER is less than max_cer and ``False`` otherwise.

@@ -56,6 +56,7 @@ from nemo.collections.common.data.lhotse.sampling import (
     FixedBucketBatchSizeConstraint2D,
     MultimodalFixedBucketBatchSizeConstraint2D,
     MultimodalSamplingConstraint,
+    SkipmeFilter,
     SpeakerFilter,
     TokenCountFilter,
     TokenPerSecondFilter,
@@ -155,6 +156,9 @@ class LhotseDataLoadingConfig:
 
     # 2.4 Filters on validation status. If the validation status is not "pass", the cut will be filtered out.
     keep: str = "pass"
+
+    # 2.5 Filter out cuts flagged with custom["_skipme"] = True.
+    filter_skipme: bool = True
 
     # 3. Supported existing NeMo options.
     shuffle: bool = False
@@ -899,6 +903,8 @@ def get_lhotse_sampler_from_config(config, global_rank, world_size, tokenizer=No
 
     # validation status filtering
     cuts = cuts.filter(ValidationStatusFilter(config.keep))
+    # Exclude cuts explicitly flagged with custom["_skipme"] = True.
+    cuts = cuts.filter(SkipmeFilter(config.filter_skipme))
     # Exclude cuts that contain known test speakers.
     cuts = cuts.filter(
         SpeakerFilter(
