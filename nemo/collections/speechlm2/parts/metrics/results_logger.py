@@ -192,6 +192,9 @@ class ResultsLogger:
         results=None,
         tokenizer=None,
         reference_audio: Optional[torch.Tensor] = None,
+        src_langs: Optional[list[str]] = None,
+        tgt_langs: Optional[list[str]] = None,
+        lang_pairs: Optional[list[str]] = None,
     ):
         rank = get_rank()
 
@@ -271,16 +274,26 @@ class ResultsLogger:
                     pred_audio_sr,
                 )
 
-            # Build metadata dictionary
-            out_dict = {
-                "id": sample_id,
-                "target_text": refs[i],
-                "pred_text": hyps[i],
-                "speech_pred_transcribed": asr_hyps[i] if asr_hyps is not None else None,
-                "pred_audio_path": out_audio_path if pred_audio is not None else None,
-            }
+            # Build metadata dictionary. Single-line JSON (JSONL) format: one compact
+            # JSON object per line, matching the eval.json format produced by
+            # simulate_streaming_riva_translate_langprompt_eval.py.
+            out_dict = {"sample_id": sample_id}
 
-            # Add source text fields if provided (DuplexSTTModel)
+            # Add language metadata if provided (e.g. NemotronVoiceTranslateSTT), taken from
+            # the dataloader batch (cut.custom["lang_src"] / cut.custom["lang_tgt"]).
+            if src_langs is not None:
+                out_dict["src_lang"] = src_langs[i]
+            if tgt_langs is not None:
+                out_dict["tgt_lang"] = tgt_langs[i]
+            if lang_pairs is not None:
+                out_dict["lang_pair"] = lang_pairs[i]
+
+            out_dict["target_text"] = refs[i]
+            out_dict["pred_text"] = hyps[i]
+            out_dict["speech_pred_transcribed"] = asr_hyps[i] if asr_hyps is not None else None
+            out_dict["pred_audio_path"] = out_audio_path if pred_audio is not None else None
+
+            # Add source text fields if provided (e.g. DuplexSTTModel, NemotronVoiceTranslateSTT)
             if src_refs is not None:
                 out_dict["src_text"] = src_refs[i]
             if src_hyps is not None:
@@ -296,15 +309,43 @@ class ResultsLogger:
             # Write immediately to disk so metadata survives a Ctrl+C or crash.
             # Rank-0 (and single-GPU) writes directly to {name}.json; other ranks
             # use a rank suffix so they don't collide during multi-GPU runs.
+            # Single-line (JSONL) format: one compact JSON object per line.
             if rank == 0:
                 rank_json_path = os.path.join(self.metadata_save_path, f"{name}.json")
             else:
                 rank_json_path = os.path.join(self.metadata_save_path, f"{name}_rank{rank}.json")
             with open(rank_json_path, 'a', encoding='utf-8') as fout:
-                fout.write(json.dumps(out_dict, ensure_ascii=False, indent=2) + '\n\n')
+                fout.write(json.dumps(out_dict, ensure_ascii=False) + '\n')
 
             # Also keep in memory for backward compatibility.
             self.cached_results[name].append(out_dict)
+
+    @staticmethod
+    def _parse_metadata_file(path: str) -> List[dict]:
+        """
+        Parse a metadata file written by `update()`.
+
+        Current format is single-line JSON (JSONL): one compact JSON object per
+        non-empty line. For backward compatibility with files written by older
+        versions of this class (pretty-printed JSON blocks separated by a blank
+        line), we fall back to that parsing scheme if line-by-line JSONL parsing
+        fails.
+        """
+        with open(path, 'r', encoding='utf-8') as fin:
+            content = fin.read().strip()
+        if not content:
+            return []
+
+        # Try JSONL first (current format): one JSON object per line.
+        lines = [l.strip() for l in content.split('\n') if l.strip()]
+        try:
+            return [json.loads(l) for l in lines]
+        except json.JSONDecodeError:
+            pass
+
+        # Fall back to legacy format: pretty-printed JSON blocks separated by a blank line.
+        blocks = [b.strip() for b in content.split('\n\n') if b.strip()]
+        return [json.loads(b) for b in blocks]
 
     def _merge_rank_files(self, dataset_name: str) -> List[dict]:
         """
@@ -339,12 +380,7 @@ class ResultsLogger:
 
             if os.path.exists(rank_file):
                 try:
-                    with open(rank_file, 'r', encoding='utf-8') as fin:
-                        content = fin.read().strip()
-                        # Entries are pretty-printed JSON blocks separated by blank lines.
-                        blocks = [b.strip() for b in content.split('\n\n') if b.strip()]
-                        rank_results = [json.loads(b) for b in blocks]
-                        all_results.extend(rank_results)
+                    all_results.extend(self._parse_metadata_file(rank_file))
                 except Exception as e:
                     logging.warning(f"Failed to read {rank_file}: {e}")
             else:
@@ -427,11 +463,11 @@ class ResultsLogger:
                     # Merge results from all ranks
                     merged_results = self._merge_rank_files(name)
 
-                # Save merged results
+                # Save merged results (single-line JSON per entry, i.e. JSONL).
                 final_json_path = os.path.join(self.metadata_save_path, f"{name}.json")
                 with open(final_json_path, 'w', encoding='utf-8') as fout:
                     for item in merged_results:
-                        fout.write(json.dumps(item, ensure_ascii=False, indent=2) + '\n\n')
+                        fout.write(json.dumps(item, ensure_ascii=False) + '\n')
                 logging.info(f"Final merged metadata file for {name} dataset saved at: {final_json_path}")
 
                 # Remove intermediate rank files (rank 1+) now that the merged

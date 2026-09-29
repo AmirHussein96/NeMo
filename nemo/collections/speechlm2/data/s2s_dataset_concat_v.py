@@ -89,8 +89,12 @@ class DuplexS2SDatasetConcatV(torch.utils.data.Dataset):
                 at positions aligned with audio frames
             - source_token_lens: Tensor of source token sequence lengths [B]
             - target_texts: List of full target texts joined from output_roles supervisions [B]
-            - source_texts: List of full source texts joined from input_roles supervisions [B]
-            - lang_prompt: List of raw lang_pair strings per sample (empty string if disabled) [B]
+            - source_texts: List of full source (input) texts joined from input_roles supervisions [B]
+            - lang_prompt: List of raw "{src}-{tgt}" lang_pair strings per sample [B] (alias of lang_pairs)
+            - src_langs: List of source language codes per sample, from cut.custom["lang_src"] [B]
+            - tgt_langs: List of target language codes per sample, from cut.custom["lang_tgt"] [B]
+            - lang_pairs: List of "{src}-{tgt}" strings per sample [B]. Always populated from
+                cut.custom, regardless of add_lang_prompt (empty string parts if metadata is missing).
             - prompt_lens: List of prompt lengths in tokens per sample (0 if disabled) [B]
 
     Notes:
@@ -198,9 +202,17 @@ class DuplexS2SDatasetConcatV(torch.utils.data.Dataset):
 
     def __getitem__(self, cuts: CutSet) -> dict:
         cuts = cuts.transform_text(_strip_timestamps)
-        source_audio, decode_source_audio_lens = collate_audio(cuts.resample(self.source_sample_rate))
-        vals = [float(c.custom['src_duration'])*self.source_sample_rate for c in cuts]
-        source_audio_lens = torch.tensor(vals, dtype=decode_source_audio_lens.dtype, device=decode_source_audio_lens.device)
+        source_audio, source_audio_lens = collate_audio(cuts.resample(self.source_sample_rate))
+        # vals = [float(c.custom['src_duration'])*self.source_sample_rate for c in cuts]
+        # source_audio_lens = torch.tensor(vals, dtype=decode_source_audio_lens.dtype, device=decode_source_audio_lens.device)
+        # `source_audio_lens` above is now always the FULL collated audio length (not the
+        # "true"/cut.custom['src_duration']-based length the commented-out override used
+        # to substitute in). `decode_source_audio_lens` -- only ever used downstream as the
+        # `tokens_len` reported by offline_inference (nemotron_voicetranslate_stt_model.py /
+        # duplex_s2s_speech_decoder_model2.py), never for masking/encoding here -- must stay
+        # in sync with that choice, so alias it to the same full length instead of the now-
+        # disabled "true" length.
+        decode_source_audio_lens = source_audio_lens
         if cuts[0].custom.get('target_audio') is not None:
             target_audio, target_audio_lens = collate_audio(
                 cuts.resample(self.target_sample_rate), recording_field="target_audio"
@@ -228,27 +240,34 @@ class DuplexS2SDatasetConcatV(torch.utils.data.Dataset):
                 cuts.resample(self.target_sample_rate), roles=self.input_roles, duration=self.training_speaker_duration
             )
 
+        # --- per-sample language metadata (always available, regardless of add_lang_prompt) ---
+        # Pulled straight from cut.custom, same fields used to build the prompt below.
+        # Exposed on the batch so downstream code (e.g. ResultsLogger) can log which
+        # language pair each prediction belongs to, without needing add_lang_prompt=True.
+        src_langs, tgt_langs, lang_pairs = [], [], []
+        for cut in cuts:
+            custom = cut.custom or {}
+            src_lang = custom.get("lang_src", "") or ""
+            tgt_lang = custom.get("lang_tgt", "") or ""
+            src_langs.append(src_lang)
+            tgt_langs.append(tgt_lang)
+            lang_pairs.append(f"{src_lang}-{tgt_lang}")
+
         # --- optional language-direction prompt ---
         # Prompt tokens are returned as a SEPARATE field (DuplexSTT-style).
         # The model's prepare_inputs inserts them into source_encoded at the feature level,
         # so target_tokens/audio are NOT modified here — no loss masking needed.
-        lang_prompts_raw = []
         prompt_token_lens_list = []
         prompt_ids_list = []
         if self.add_lang_prompt:
             pad_id = get_pad_id(self.tokenizer)
-            for i, cut in enumerate(cuts):
-                custom = cut.custom or {}
-                src_lang = custom.get("lang_src", "")
-                tgt_lang = custom.get("lang_tgt", "")
+            for src_lang, tgt_lang in zip(src_langs, tgt_langs):
                 prompt_ids = self._build_lang_prompt_tokens(src_lang, tgt_lang, device=target_tokens.device)
                 prompt_ids_list.append(prompt_ids)
                 prompt_token_lens_list.append(len(prompt_ids))
-                lang_prompts_raw.append(f"{src_lang}-{tgt_lang}")
             prompt_tokens = collate_vectors(prompt_ids_list, padding_value=pad_id)
             prompt_token_lens = torch.tensor(prompt_token_lens_list, dtype=torch.long)
         else:
-            lang_prompts_raw = [""] * len(cuts)
             prompt_tokens = None
             prompt_token_lens = torch.zeros(len(cuts), dtype=torch.long)
 
@@ -274,7 +293,10 @@ class DuplexS2SDatasetConcatV(torch.utils.data.Dataset):
             "first_turn_audio": first_turn_audio,
             "first_turn_audio_lens": first_turn_audio_lens,
             "formatter": [getattr(cut, "formatter", "s2s_duplex") for cut in cuts],
-            "lang_prompt": lang_prompts_raw,
+            "lang_prompt": lang_pairs,
+            "src_langs": src_langs,
+            "tgt_langs": tgt_langs,
+            "lang_pairs": lang_pairs,
             "prompt_token_lens": prompt_token_lens,
             **( {"prompt_tokens": prompt_tokens} if prompt_tokens is not None else {} ),
         }

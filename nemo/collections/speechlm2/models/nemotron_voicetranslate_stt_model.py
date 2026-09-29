@@ -973,6 +973,9 @@ class NemotronVoiceTranslateSTT(LightningModule, HFHubMixin):
                     tokenizer=self.tokenizer,
                     src_refs=dataset_batch.get("source_texts") if src_hyps_rnnt is not None else None,
                     src_hyps=src_hyps_rnnt,
+                    src_langs=dataset_batch.get("src_langs"),
+                    tgt_langs=dataset_batch.get("tgt_langs"),
+                    lang_pairs=dataset_batch.get("lang_pairs"),
                 )
 
             self.bleu.update(name=name, refs=dataset_batch["target_texts"], hyps=results["text"])
@@ -1069,7 +1072,7 @@ class NemotronVoiceTranslateSTT(LightningModule, HFHubMixin):
         T_tensor = torch.tensor([T_local], device=source_encoded.device)
         if self._use_fsdp:
             dist.all_reduce(T_tensor, op=dist.ReduceOp.MAX)
-        T = int(self.cfg.get("inference_tgt_len", 1.5 * T_tensor.item()))
+        T = int(self.cfg.get("inference_tgt_len", 1 * T_tensor.item()))
 
         if T > T_local:
             last_frame = source_encoded[:, T_local - 1 : T_local, :]
