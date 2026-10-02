@@ -68,6 +68,22 @@ def cutset_shar_path(cutset_path: Path) -> Path:
 
 
 @pytest.fixture(scope="session")
+def cutset_shar_path_with_skipme(cutset_path: Path) -> Path:
+    """10 utterances of length 1s as a Lhotse Shar (tarred) CutSet, last 2 flagged `_skipme=True`."""
+    from lhotse import CutSet
+
+    cuts = CutSet.from_file(cutset_path).modify_ids(lambda id: f"skipme-{id}")
+    cuts = list(cuts)
+    for c in cuts[-2:]:
+        c.custom = {**(c.custom or {}), "_skipme": True}
+    cuts = CutSet.from_cuts(cuts)
+    p = cutset_path.parent / "shar-with-skipme"
+    p.mkdir(exist_ok=True)
+    cuts.to_shar(p, fields={"recording": "wav"}, shard_size=5)
+    return p
+
+
+@pytest.fixture(scope="session")
 def cutset_shar_path_other(cutset_path: Path) -> Path:
     """10 utterances of length 1s as a Lhotse Shar (tarred) CutSet, but with different IDs."""
     from lhotse import CutSet
@@ -2755,6 +2771,68 @@ def test_dataloader_from_data_input_cfg_yaml_path_with_skipme(cutset_shar_path, 
     skipme_s = [cut.custom.get('_skipme', 0) for batch in batches for cut in batch]
 
     assert not any(skipme_s)
+
+
+def test_skipme_filtered_before_weighted_mux(cutset_shar_path, cutset_shar_path_with_skipme):
+    """
+    Regression test: `_skipme` filtering must be applied to each leaf dataset *before* the
+    weighted `mux()` combines them, not only on the already-combined stream. Otherwise cuts
+    discarded post-mux silently dilute a dataset's effective sampling weight below what its
+    configured `weight:` implies (a source with a high skipme rate ends up under-represented
+    relative to its nominal weight). See `parse_and_combine_datasets` in cutset.py.
+
+    D1 (lhotse_shar) has 10 cuts, 2 of which are flagged `_skipme=True`.
+    D2 (lhotse_shar) has 10 clean cuts, none flagged.
+    Both use the `lhotse_shar` reader (same source type used in production multi-group
+    configs) rather than `nemo_tarred`, whose `LazyNeMoTarredIterator` applies its own
+    unconditional `_skipme` skip at the raw manifest-parsing layer regardless of this
+    config flag — that's a separate mechanism and would confound this test.
+    With `force_finite=True`, a weighted mux of two finite sources still consumes every
+    eligible cut from both regardless of the weight ratio (weight only affects draw order),
+    so the finite totals below are deterministic.
+    """
+    from nemo.collections.common.data.lhotse.cutset import read_cutset_from_config
+
+    def make_config(filter_skipme):
+        return OmegaConf.create(
+            {
+                "input_cfg": [
+                    {
+                        "type": "lhotse_shar",
+                        "shar_path": cutset_shar_path_with_skipme,
+                        "weight": 0.9,
+                        "tags": {"dataset_name": "D1"},
+                    },
+                    {
+                        "type": "lhotse_shar",
+                        "shar_path": cutset_shar_path,
+                        "weight": 0.1,
+                        "tags": {"dataset_name": "D2"},
+                    },
+                ],
+                "sample_rate": 16000,
+                "shuffle": False,
+                "shard_seed": 0,
+                "force_finite": True,
+                "filter_skipme": filter_skipme,
+            }
+        )
+
+    # filter_skipme=True (default): D1 should contribute only its 8 non-skipme cuts.
+    cuts, _ = read_cutset_from_config(make_config(filter_skipme=True))
+    items = list(cuts)
+    counts = Counter(c.custom["dataset_name"] for c in items)
+    assert counts["D1"] == 8, counts
+    assert counts["D2"] == 10, counts
+    assert not any(c.custom.get("_skipme", False) for c in items)
+
+    # filter_skipme=False: nothing is discarded, D1 keeps all 10 cuts including the 2 flagged ones.
+    cuts, _ = read_cutset_from_config(make_config(filter_skipme=False))
+    items = list(cuts)
+    counts = Counter(c.custom["dataset_name"] for c in items)
+    assert counts["D1"] == 10, counts
+    assert counts["D2"] == 10, counts
+    assert sum(1 for c in items if c.custom.get("_skipme", False)) == 2
 
 
 def test_dataloader_lhotse_shar_nemo_tarred_slice_length(

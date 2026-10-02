@@ -41,6 +41,7 @@ from nemo.collections.common.data.lhotse.nemo_adapters import (
     LazyParquetIterator,
     expand_sharded_filepaths,
 )
+from nemo.collections.common.data.lhotse.sampling import SkipmeFilter
 from nemo.collections.common.data.lhotse.text_adapters import (
     AudioTurn,
     LhotseTextAdapter,
@@ -279,6 +280,9 @@ def read_dataset_config(config) -> tuple[CutSet, bool]:
         "lang_field": config.get("lang_field", "lang"),
         "metadata_only": config.get("metadata_only", False),
         "force_finite": config.get("force_finite", False),
+        # Filter out cuts flagged with custom["_skipme"] = True, applied per leaf dataset
+        # before weighted mux so that `weight:` ratios reflect post-filter proportions.
+        "filter_skipme": config.get("filter_skipme", True),
         "max_open_streams": config.get("max_open_streams", None),
         "audio_locator_tag": config.get("audio_locator_tag", None),
         "token_equivalent_duration": config.get("token_equivalent_duration", None),
@@ -630,6 +634,10 @@ def parse_and_combine_datasets(
 
         # Load the item (which may also be another group) as a CutSet.
         item_cuts, item_is_tarred = parse_group(item, next_propagate_attrs)
+        # Apply skipme filtering per leaf/group *before* weighted mux, so that `weight:`
+        # ratios are computed over already-eligible cuts instead of being diluted by
+        # cuts that get discarded downstream (see SkipmeFilter in sampling.py).
+        item_cuts = item_cuts.filter(SkipmeFilter(item.get("filter_skipme", True)))
         cuts.append(item_cuts)
         tarred_status.append(item_is_tarred)
         if (w := item.get("weight")) is not None:

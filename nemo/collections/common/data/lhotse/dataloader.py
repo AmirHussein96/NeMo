@@ -56,7 +56,6 @@ from nemo.collections.common.data.lhotse.sampling import (
     FixedBucketBatchSizeConstraint2D,
     MultimodalFixedBucketBatchSizeConstraint2D,
     MultimodalSamplingConstraint,
-    SkipmeFilter,
     SpeakerFilter,
     TokenCountFilter,
     TokenPerSecondFilter,
@@ -903,8 +902,9 @@ def get_lhotse_sampler_from_config(config, global_rank, world_size, tokenizer=No
 
     # validation status filtering
     cuts = cuts.filter(ValidationStatusFilter(config.keep))
-    # Exclude cuts explicitly flagged with custom["_skipme"] = True.
-    cuts = cuts.filter(SkipmeFilter(config.filter_skipme))
+    # Note: cuts explicitly flagged with custom["_skipme"] = True are filtered out earlier,
+    # per leaf/group in parse_and_combine_datasets (cutset.py), before weighted mux() combines
+    # them. That ensures `weight:` ratios reflect post-filter proportions.
     # Exclude cuts that contain known test speakers.
     cuts = cuts.filter(
         SpeakerFilter(
