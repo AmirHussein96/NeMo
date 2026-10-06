@@ -442,6 +442,7 @@ class NemotronVoiceTranslate(LightningModule, HFHubMixin):
         incremental_audio_decoding: bool = None,   # None → read from cfg (default False)
         generation_config: dict = None,
         guidance_enabled: bool = None,    # None → read from cfg (default True)
+        generate_speech: bool = None,     # None → read from cfg (default True); False → text-only, skip TTS entirely
     ) -> dict:
         """
         Full offline speech-to-speech translation inference.
@@ -473,6 +474,11 @@ class NemotronVoiceTranslate(LightningModule, HFHubMixin):
             (lower latency, higher compute); otherwise decode all at end.
         generation_config : TTS sampling parameters; defaults from tts_model.
         guidance_enabled : enable classifier-free guidance in TTS.
+        generate_speech : if False, skip TTS entirely (no speaker-prompt init,
+            no vocab bridge, no TTS autoregressive loop, no codec decode) —
+            only the LLM text-translation pass runs. Much faster than
+            decode_audio=False, which still runs the full TTS loop and only
+            skips the final codec-to-waveform step.
 
         Returns
         -------
@@ -480,8 +486,8 @@ class NemotronVoiceTranslate(LightningModule, HFHubMixin):
             "text"         : List[str]  — generated text per sample.
             "tokens_text"  : (B, T)    — generated text token ids.
             "tokens_len"   : (B,)      — valid length per sample.
-            "audio"        : (B, T_wave) — generated waveform (if decode_audio).
-            "audio_len"    : (B,)      — waveform lengths in samples (if decode_audio).
+            "audio"        : (B, T_wave) — generated waveform (if generate_speech and decode_audio).
+            "audio_len"    : (B,)      — waveform lengths in samples (if generate_speech and decode_audio).
         """
 
         # Resolve incremental_audio_decoding: function arg overrides cfg.
@@ -493,6 +499,10 @@ class NemotronVoiceTranslate(LightningModule, HFHubMixin):
         # Default is True (classifier-free guidance on), matching marianag's eval_config.yaml.
         if guidance_enabled is None:
             guidance_enabled = self.cfg.speech_generation.get("inference_guidance_enabled", True)
+
+        # Resolve generate_speech: function arg overrides cfg (default True).
+        if generate_speech is None:
+            generate_speech = self.cfg.get("generate_speech", True)
 
         # -------------------------------------------------------- #
         # 1. Encode source audio                                     #
@@ -550,31 +560,33 @@ class NemotronVoiceTranslate(LightningModule, HFHubMixin):
 
         # -------------------------------------------------------- #
         # 4. Initialize EAR TTS with speaker audio prompt            #
+        #    (skipped entirely when generate_speech=False)          #
         # -------------------------------------------------------- #
-        if speaker_audio is None:
-            speaker_name = self.cfg.get("inference_speaker_name", None)
-            if speaker_name is not None:
-                speaker_audio = None
-                speaker_audio_lens = None
+        if generate_speech:
+            if speaker_audio is None:
+                speaker_name = self.cfg.get("inference_speaker_name", None)
+                if speaker_name is not None:
+                    speaker_audio = None
+                    speaker_audio_lens = None
+                else:
+                    spk_audio_raw, sr = load_audio_librosa(self.cfg.inference_speaker_reference)
+                    spk_audio = resample(spk_audio_raw, sr, self.tts_model.target_sample_rate)
+                    speaker_audio = spk_audio.repeat(B, 1).to(self.device)
+                    speaker_audio_lens = (
+                        torch.tensor([speaker_audio.size(1)]).long().repeat(B).to(self.device)
+                    )
             else:
-                spk_audio_raw, sr = load_audio_librosa(self.cfg.inference_speaker_reference)
-                spk_audio = resample(spk_audio_raw, sr, self.tts_model.target_sample_rate)
-                speaker_audio = spk_audio.repeat(B, 1).to(self.device)
-                speaker_audio_lens = (
-                    torch.tensor([speaker_audio.size(1)]).long().repeat(B).to(self.device)
-                )
-        else:
-            speaker_name = None
+                speaker_name = None
 
-        self.tts_model.set_init_inputs(
-            speaker_audio=speaker_audio,
-            speaker_audio_lens=speaker_audio_lens,
-            speaker_name=speaker_name,
-        )
-        init_inputs = self.tts_model.get_init_inputs(B=B)
+            self.tts_model.set_init_inputs(
+                speaker_audio=speaker_audio,
+                speaker_audio_lens=speaker_audio_lens,
+                speaker_name=speaker_name,
+            )
+            init_inputs = self.tts_model.get_init_inputs(B=B)
 
-        if generation_config is None:
-            generation_config = self.tts_model._get_generation_config(guidance_enabled)
+            if generation_config is None:
+                generation_config = self.tts_model._get_generation_config(guidance_enabled)
 
         # Output buffers
         gen_text_len = torch.full((B,), T, device=self.device, dtype=input_signal_lens.dtype)
@@ -590,20 +602,22 @@ class NemotronVoiceTranslate(LightningModule, HFHubMixin):
         #    tokenizers. At each step we decode the accumulated LLM  #
         #    text and retokenize it with the TTS tokenizer, then     #
         #    feed the latest stable TTS token to infer_codes_one_step.
+        #    (TTS warmup skipped entirely when generate_speech=False.)
         # -------------------------------------------------------- #
-        tts_tok    = self.tts_model.tokenizer
-        tts_pad_id = self.tts_model.text_pad_id   # correct pad used during EAR TTS training
+        if generate_speech:
+            tts_tok    = self.tts_model.tokenizer
+            tts_pad_id = self.tts_model.text_pad_id   # correct pad used during EAR TTS training
 
-        # TTS warmup on speaker prompt — identical to nemotron_voicechat.py
-        init_inputs.update({"use_cache": True, "past_key_values": None, "guidance_enabled": guidance_enabled})
-        outputs = self.tts_model.tts_model(**init_inputs)
-        code    = init_inputs["code"][:, -1:]
+            # TTS warmup on speaker prompt — identical to nemotron_voicechat.py
+            init_inputs.update({"use_cache": True, "past_key_values": None, "guidance_enabled": guidance_enabled})
+            outputs = self.tts_model.tts_model(**init_inputs)
+            code    = init_inputs["code"][:, -1:]
 
-        past_key_values = outputs.past_key_values
-        num_quantizers  = self.tts_model.tts_model.config.num_quantizers
-        first_context_subword_id = init_inputs["subword_ids"][:, -1].unsqueeze(-1)
-        audio_pred      = None
-        audio_pred_len  = torch.zeros(B, device=self.device, dtype=torch.long)
+            past_key_values = outputs.past_key_values
+            num_quantizers  = self.tts_model.tts_model.config.num_quantizers
+            first_context_subword_id = init_inputs["subword_ids"][:, -1].unsqueeze(-1)
+            audio_pred      = None
+            audio_pred_len  = torch.zeros(B, device=self.device, dtype=torch.long)
 
         # -------------------------------------------------------- #
         # Pass 1 — LLM-only autoregressive loop                  #
@@ -641,81 +655,83 @@ class NemotronVoiceTranslate(LightningModule, HFHubMixin):
         #   Only content between LLM BOS and EOS is decoded and   #
         #   re-tokenised.  T_tts follows the EAR TTS eval recipe: #
         #   BOS + content + pad_factor × seg_len PADs + EOS.      #
+        #   (skipped entirely when generate_speech=False)         #
         # -------------------------------------------------------- #
-        # Pass pad_factor from config only when explicitly set, so each subclass
-        # can define its own default via the _build_tts_sequence signature.
-        # (e.g. base class defaults to 3, sync class defaults to 5.)
-        _pad_factor_cfg = self.cfg.get("tts_pad_factor", None)
-        _tts_build_kwargs = {"pad_factor": _pad_factor_cfg} if _pad_factor_cfg is not None else {}
-        tts_input, T_tts, tts_eos_positions = self._build_tts_sequence(
-            gen_text, tts_tok, tts_pad_id,
-            gen_text_len=gen_text_len,
-            **_tts_build_kwargs,
-        )
-
-        # Allocate TTS buffers with the (potentially larger) T_tts.
-        gen_codes    = torch.zeros(B, T_tts, num_quantizers, device=self.device, dtype=torch.long)
-        subword_mask = torch.ones(B, T_tts, device=self.device, dtype=torch.bool)
-
-        # -------------------------------------------------------- #
-        # Pass 3 — TTS-only autoregressive loop                   #
-        #   Matches duplex_ear_tts.py offline_inference exactly:  #
-        #   loop starts at t=0 so BOS is processed as current     #
-        #   before the first word (standalone TTS eval recipe).   #
-        # -------------------------------------------------------- #
-        for t in range(T_tts):
-            current_subword_id   = tts_input[:, t : t + 1]
-            prev_subword_id      = (
-                first_context_subword_id if t == 0
-                else tts_input[:, t - 1 : t]
+        if generate_speech:
+            # Pass pad_factor from config only when explicitly set, so each subclass
+            # can define its own default via the _build_tts_sequence signature.
+            # (e.g. base class defaults to 3, sync class defaults to 5.)
+            _pad_factor_cfg = self.cfg.get("tts_pad_factor", None)
+            _tts_build_kwargs = {"pad_factor": _pad_factor_cfg} if _pad_factor_cfg is not None else {}
+            tts_input, T_tts, tts_eos_positions = self._build_tts_sequence(
+                gen_text, tts_tok, tts_pad_id,
+                gen_text_len=gen_text_len,
+                **_tts_build_kwargs,
             )
-            current_subword_mask = subword_mask[:, t].unsqueeze(-1)
 
-            code, past_key_values = self.tts_model.infer_codes_one_step(
-                current_subword_id=current_subword_id,
-                prev_subword_id=prev_subword_id,
-                current_subword_mask=current_subword_mask,
-                prev_audio_tokens=code,
-                past_key_values=past_key_values,
-                guidance_enabled=guidance_enabled,
-                generation_config=generation_config,
-                ignore_eos_flag_stop=True,
-            )
-            gen_codes[:, t] = code.squeeze(1)
+            # Allocate TTS buffers with the (potentially larger) T_tts.
+            gen_codes    = torch.zeros(B, T_tts, num_quantizers, device=self.device, dtype=torch.long)
+            subword_mask = torch.ones(B, T_tts, device=self.device, dtype=torch.bool)
 
-            if decode_audio and incremental_audio_decoding:
-                audio_pred_i, audio_pred_i_len = self.tts_model.decode_one_audio_step(
-                    gen_codes[:, : t + 1],
-                    number_prev_tokens=self.cfg.get(
-                        "inference_codec_decoding_prev_tokens_number", None
-                    ),
+            # -------------------------------------------------------- #
+            # Pass 3 — TTS-only autoregressive loop                   #
+            #   Matches duplex_ear_tts.py offline_inference exactly:  #
+            #   loop starts at t=0 so BOS is processed as current     #
+            #   before the first word (standalone TTS eval recipe).   #
+            # -------------------------------------------------------- #
+            for t in range(T_tts):
+                current_subword_id   = tts_input[:, t : t + 1]
+                prev_subword_id      = (
+                    first_context_subword_id if t == 0
+                    else tts_input[:, t - 1 : t]
                 )
-                audio_pred = (
-                    audio_pred_i if audio_pred is None
-                    else torch.cat([audio_pred, audio_pred_i], dim=1)
+                current_subword_mask = subword_mask[:, t].unsqueeze(-1)
+
+                code, past_key_values = self.tts_model.infer_codes_one_step(
+                    current_subword_id=current_subword_id,
+                    prev_subword_id=prev_subword_id,
+                    current_subword_mask=current_subword_mask,
+                    prev_audio_tokens=code,
+                    past_key_values=past_key_values,
+                    guidance_enabled=guidance_enabled,
+                    generation_config=generation_config,
+                    ignore_eos_flag_stop=True,
                 )
-                audio_pred_len += audio_pred_i_len
+                gen_codes[:, t] = code.squeeze(1)
 
-            logging.debug(f"TTS step {t}/{T_tts}")
-
-        # -------------------------------------------------------- #
-        # 7. Compute per-sample audio length from TTS EOS position. #
-        #    Use positions returned by _build_tts_sequence directly  #
-        #    rather than searching by token ID — the fast tokenizer  #
-        #    may return unk_id for </s> making the search unreliable. #
-        # -------------------------------------------------------- #
-        _AUDIO_TRAIL = 10
-        gen_codes_lengths = torch.tensor(
-            [min(eos_pos + 1 + _AUDIO_TRAIL, T_tts) for eos_pos in tts_eos_positions],
-            device=self.device, dtype=torch.long,
-        )
-
-        if decode_audio:
-            if not incremental_audio_decoding:
-                with fp32_precision(), torch.no_grad():
-                    audio_pred, audio_pred_len = self.tts_model.audio_codec.decode(
-                        gen_codes, gen_codes_lengths
+                if decode_audio and incremental_audio_decoding:
+                    audio_pred_i, audio_pred_i_len = self.tts_model.decode_one_audio_step(
+                        gen_codes[:, : t + 1],
+                        number_prev_tokens=self.cfg.get(
+                            "inference_codec_decoding_prev_tokens_number", None
+                        ),
                     )
+                    audio_pred = (
+                        audio_pred_i if audio_pred is None
+                        else torch.cat([audio_pred, audio_pred_i], dim=1)
+                    )
+                    audio_pred_len += audio_pred_i_len
+
+                logging.debug(f"TTS step {t}/{T_tts}")
+
+            # -------------------------------------------------------- #
+            # 7. Compute per-sample audio length from TTS EOS position. #
+            #    Use positions returned by _build_tts_sequence directly  #
+            #    rather than searching by token ID — the fast tokenizer  #
+            #    may return unk_id for </s> making the search unreliable. #
+            # -------------------------------------------------------- #
+            _AUDIO_TRAIL = 10
+            gen_codes_lengths = torch.tensor(
+                [min(eos_pos + 1 + _AUDIO_TRAIL, T_tts) for eos_pos in tts_eos_positions],
+                device=self.device, dtype=torch.long,
+            )
+
+            if decode_audio:
+                if not incremental_audio_decoding:
+                    with fp32_precision(), torch.no_grad():
+                        audio_pred, audio_pred_len = self.tts_model.audio_codec.decode(
+                            gen_codes, gen_codes_lengths
+                        )
 
         # -------------------------------------------------------- #
         # 9. Post-process text                                       #
@@ -745,7 +761,7 @@ class NemotronVoiceTranslate(LightningModule, HFHubMixin):
             "tokens_len": gen_text_len,
         }
 
-        if decode_audio:
+        if generate_speech and decode_audio:
             ans["audio"]     = audio_pred.squeeze(1)
             ans["audio_len"] = audio_pred_len
 
@@ -808,13 +824,23 @@ class NemotronVoiceTranslate(LightningModule, HFHubMixin):
     def on_validation_epoch_start(self) -> None:
         self.on_train_epoch_start()
         self.results_logger = ResultsLogger(self.validation_save_path).reset()
-        self.asr_bleu = ASRBLEU(self.cfg.scoring_asr).reset()
+        self._generate_speech = self.cfg.get("generate_speech", True)
+        if self._generate_speech:
+            self.asr_bleu = ASRBLEU(self.cfg.scoring_asr).reset()
+        else:
+            # Text-only eval: don't even load the scoring ASR model.
+            logging.info(
+                "NemotronVoiceTranslate: model.generate_speech=false — skipping TTS "
+                "synthesis and ASR-BLEU scoring; text-only evaluation."
+            )
+            self.asr_bleu = None
         self.bleu = BLEU().reset()
 
     def on_validation_epoch_end(self, prefix="val") -> None:
-        asr_bleu = self.asr_bleu.compute()
-        for k, m in asr_bleu.items():
-            self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+        if self.asr_bleu is not None:
+            asr_bleu = self.asr_bleu.compute()
+            for k, m in asr_bleu.items():
+                self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
         bleu = self.bleu.compute()
         for k, m in bleu.items():
             self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
@@ -865,19 +891,22 @@ class NemotronVoiceTranslate(LightningModule, HFHubMixin):
                 input_signal_lens=dataset_batch["source_audio_lens"],
                 speaker_audio=batch_speaker_audio,
                 speaker_audio_lens=batch_speaker_audio_lens,
+                generate_speech=self._generate_speech,
             )
 
             with fp32_precision():
-                asr_hyps = self.asr_bleu.update(
-                    name=name,
-                    refs=dataset_batch["target_texts"],
-                    pred_audio=resample(
-                        results["audio"], self.target_sample_rate, 16000
-                    ),
-                    pred_audio_lens=(
-                        results["audio_len"] / self.target_sample_rate * 16000
-                    ).to(torch.long),
-                )
+                asr_hyps = None
+                if self._generate_speech:
+                    asr_hyps = self.asr_bleu.update(
+                        name=name,
+                        refs=dataset_batch["target_texts"],
+                        pred_audio=resample(
+                            results["audio"], self.target_sample_rate, 16000
+                        ),
+                        pred_audio_lens=(
+                            results["audio_len"] / self.target_sample_rate * 16000
+                        ).to(torch.long),
+                    )
 
                 self.results_logger.update(
                     name=name,
@@ -885,7 +914,7 @@ class NemotronVoiceTranslate(LightningModule, HFHubMixin):
                     hyps=results["text"],
                     asr_hyps=asr_hyps,
                     samples_id=dataset_batch["sample_id"],
-                    pred_audio=results["audio"],
+                    pred_audio=results.get("audio"),
                     pred_audio_sr=self.target_sample_rate,
                     user_audio=dataset_batch["source_audio"],
                     user_audio_sr=self.source_sample_rate,
