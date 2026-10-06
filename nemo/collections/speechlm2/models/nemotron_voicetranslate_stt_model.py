@@ -971,7 +971,7 @@ class NemotronVoiceTranslateSTT(LightningModule, HFHubMixin):
                     fps=self.source_fps,
                     results=results if self.cfg.get("dump_tokens_text", False) else None,
                     tokenizer=self.tokenizer,
-                    src_refs=dataset_batch.get("source_texts") if src_hyps_rnnt is not None else None,
+                    src_refs=dataset_batch.get("source_texts"),
                     src_hyps=src_hyps_rnnt,
                     src_langs=dataset_batch.get("src_langs"),
                     tgt_langs=dataset_batch.get("tgt_langs"),
