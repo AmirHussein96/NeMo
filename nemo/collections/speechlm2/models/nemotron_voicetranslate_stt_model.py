@@ -227,6 +227,22 @@ class NemotronVoiceTranslateSTT(LightningModule, HFHubMixin):
         return self.tokenizer.eos_id
 
     @property
+    def text_start_id(self) -> int:
+        """Phrase-start marker ('^') written by the dataset's build_token_channel."""
+        return self._single_token_id("^")
+
+    @property
+    def text_end_id(self) -> int:
+        """Phrase-end marker ('*') written by the dataset's build_token_channel."""
+        return self._single_token_id("*")
+
+    def _single_token_id(self, text: str) -> int:
+        ids = self.tokenizer.text_to_ids(text)
+        if len(ids) != 1:
+            raise ValueError(f"Tokenizer must encode {text!r} as exactly one token, got {ids}.")
+        return ids[0]
+
+    @property
     def text_pad_id(self) -> int:
         """
         Text pad ID is used as a 'blank' for frames when the model is not speaking
@@ -1141,8 +1157,12 @@ class NemotronVoiceTranslateSTT(LightningModule, HFHubMixin):
             gen_text = gen_text_out
             gen_text_len = gen_text_len_out
 
+        # Drop the '^' / '*' phrase markers from the decoded text (replace with pad, which tokens_to_str strips).
+        is_marker = (gen_text == self.text_start_id) | (gen_text == self.text_end_id)
+        gen_text_clean = gen_text.masked_fill(is_marker, self.text_pad_id)
+
         result = {
-            "text": tokens_to_str(gen_text, gen_text_len, tokenizer=self.tokenizer, pad_id=self.text_pad_id),
+            "text": tokens_to_str(gen_text_clean, gen_text_len, tokenizer=self.tokenizer, pad_id=self.text_pad_id),
             "tokens_text": gen_text,
             "tokens_len": dataset_batch["decode_source_audio_lens"],
             # Validation-time-only RNNT greedy decode (asr_adapter -> rnnt_decoder -> rnnt_joint)

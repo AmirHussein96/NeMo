@@ -11,7 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from .data import DataModule, DuplexEARTTSDataset, DuplexS2SDataset, DuplexS2SDatasetConcatV, DuplexSTTDataset, SALMDataset
+from .data import (
+    DataModule,
+    DuplexEARTTSDataset,
+    DuplexS2SDataset,
+    DuplexS2SDatasetConcatV,
+    DuplexS2SDatasetConcatV1_1,
+    DuplexSTTDataset,
+    SALMDataset,
+)
 from .models import (
     SALM,
     DuplexEARTTS,
@@ -32,6 +40,7 @@ __all__ = [
     'DataModule',
     'DuplexS2SDataset',
     'DuplexS2SDatasetConcatV',
+    'DuplexS2SDatasetConcatV1_1',
     'DuplexSTTDataset',
     'DuplexEARTTSDataset',
     'SALMDataset',
