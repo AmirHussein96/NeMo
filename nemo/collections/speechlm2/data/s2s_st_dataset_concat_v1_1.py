@@ -16,10 +16,10 @@ import re
 import torch
 import torch.utils.data
 
-from lhotse import CutSet, Seconds, compute_num_frames
+from lhotse import CutSet, Seconds, SupervisionSegment, compute_num_frames
 from lhotse.cut import Cut
 from lhotse.dataset.collation import collate_audio, collate_vectors
-from lhotse.utils import ifnone
+from lhotse.utils import fastcopy, ifnone
 
 from nemo.collections.common.tokenizers import TokenizerSpec
 from nemo.collections.speechlm2.data.utils import get_pad_id
@@ -31,6 +31,8 @@ _DEFAULT_LANG_MAP = {
     "es": "Spanish",
     "fr": "French",
 }
+
+_TOKEN_STATS_LOG_EVERY = 500  # batches (per dataloader worker)
 
 
 class DuplexS2SDatasetConcatV1_1(torch.utils.data.Dataset):
@@ -76,6 +78,13 @@ class DuplexS2SDatasetConcatV1_1(torch.utils.data.Dataset):
             prompt text. Defaults to ``{"en": "English", "de": "German",
             "es": "Spanish", "fr": "French"}``.
 
+        min_sup_frames (int, optional):
+            Minimum frame span for a middle supervision to hold ``^ text *`` (one text token).
+            Supervisions with a smaller span are merged into the next supervision of the same role
+            (or into the previous one if it is the last), instead of being skipped. The first and
+            the last supervision need one extra frame each (for BOS and EOS respectively).
+            ``0`` disables merging. Default: ``3``.
+
     Returns:
         A dictionary with the following keys:
             - source_audio: Tensor of source waveform samples [B, T]
@@ -120,8 +129,12 @@ class DuplexS2SDatasetConcatV1_1(torch.utils.data.Dataset):
         training_speaker_duration: float = 3.0,
         add_lang_prompt: bool = False,
         lang_map: dict = None,
+        min_sup_frames: int = 3,
     ):
         self.tokenizer = tokenizer
+        self.min_sup_frames = min_sup_frames
+        # self._token_stats = {"target": {}, "source": {}}  # per-worker counters, see `_log_token_stats`
+        # self._num_batches = 0
         self.frame_length = frame_length
         self.source_sample_rate = source_sample_rate
         self.target_sample_rate = target_sample_rate
@@ -222,10 +235,24 @@ class DuplexS2SDatasetConcatV1_1(torch.utils.data.Dataset):
             target_audio, target_audio_lens = None, None
             
         target_tokens, target_token_lens = collate_token_channel(
-                                            cuts, self.tokenizer, self.frame_length, roles=self.output_roles)
-        source_tokens, source_token_lens = collate_token_channel(
-            cuts, self.tokenizer, self.frame_length, roles=self.input_roles
+            cuts,
+            self.tokenizer,
+            self.frame_length,
+            roles=self.output_roles,
+            min_sup_frames=self.min_sup_frames,
+            # stats=self._token_stats["target"],
         )
+        source_tokens, source_token_lens = collate_token_channel(
+            cuts,
+            self.tokenizer,
+            self.frame_length,
+            roles=self.input_roles,
+            min_sup_frames=self.min_sup_frames,
+            # stats=self._token_stats["source"],
+        )
+        # self._num_batches += 1
+        # if self._num_batches % _TOKEN_STATS_LOG_EVERY == 0:
+        #     _log_token_stats(self._token_stats, self._num_batches)
         # extract speaker first turn audio for speaker conditioning
         if self._fixed_spk_audio is not None:
             batch_size = len(cuts)
@@ -340,10 +367,20 @@ def collate_token_channel(
     tokenizer: TokenizerSpec,
     frame_length: Seconds,
     roles: set[str],
+    min_sup_frames: int = 3,
+    stats: dict = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     pad_id = get_pad_id(tokenizer)
     tokens = [
-        build_token_channel(c, tokenizer=tokenizer, frame_length=frame_length, roles=roles, pad_id=pad_id)
+        build_token_channel(
+            c,
+            tokenizer=tokenizer,
+            frame_length=frame_length,
+            roles=roles,
+            pad_id=pad_id,
+            min_sup_frames=min_sup_frames,
+            stats=stats,
+        )
         for c in cuts
     ]
     token_lens = torch.tensor([len(tt) for tt in tokens])
@@ -359,6 +396,8 @@ def build_token_channel(
     pad_id: int = -1,
     start_id: int = None,
     end_id: int = None,
+    min_sup_frames: int = 3,
+    stats: dict = None,
 ) -> torch.Tensor:
     """
     Layout (one token per frame)::
@@ -371,6 +410,12 @@ def build_token_channel(
     * EOS: alone on the last frame after all supervisions. The final valid frame of the last supervision
       (``eospos - 1``) is used, since training truncates the token channel to ``eospos`` frames and anything
       beyond would never appear in the labels. The last phrase's ``*`` therefore sits on ``eospos - 2``.
+
+    Supervisions too short to hold ``^ text *`` are first merged into a neighbour (see
+    ``_merge_short_supervisions``); only those that cannot be merged are skipped with a warning.
+
+    If ``stats`` is given, it is updated in place with the counters ``phrases`` (written), ``truncated`` (phrases whose
+    text was cut to fit before ``*``), ``dropped_tokens`` (text tokens lost to that cut) and ``skipped``.
     """
     diagnostic = f"Extra info: {cut.id=}"
     if getattr(cut, "shard_origin", None) is not None:
@@ -383,6 +428,7 @@ def build_token_channel(
     total = compute_num_frames(cut.duration, frame_length, cut.sampling_rate)
     tokens = torch.ones(total, dtype=torch.long) * pad_id
     sups = [s for s in cut.supervisions if s.speaker in roles]
+    sups = _merge_short_supervisions(sups, frame_length, cut.sampling_rate, min_sup_frames)
     last_eospos = None
     bos_written = False
     for i, supervision in enumerate(sups):
@@ -404,12 +450,16 @@ def build_token_channel(
             logging.warning(
                 f"Supervision too short for ^ ... * markers ({start_pos=} {end_frame=}); skipping. {diagnostic}"
             )
+            # _count(stats, skipped=1)
             continue
 
         text = supervision.text if not bos_written else " " + supervision.text
         bos_written = True
         available_frames_for_text = max(end_frame - start_pos - len(prefix), 0)
-        text_ids = tokenizer.text_to_ids(text)[:available_frames_for_text]
+        text_ids = tokenizer.text_to_ids(text)
+        # dropped = max(len(text_ids) - available_frames_for_text, 0)
+        # _count(stats, phrases=1, truncated=int(dropped > 0), dropped_tokens=dropped)
+        text_ids = text_ids[:available_frames_for_text]
         ids = torch.as_tensor(prefix + text_ids, dtype=torch.long)
 
         tokens[start_pos : start_pos + len(ids)] = ids
@@ -440,3 +490,64 @@ def _strip_timestamps(
     # Regexp pattern args are cached compiled patterns (micro-optimization).
     text = _TIMESTAMP_PATTERN.sub("", text)  # strip timestamp tokens if present
     return _SPACE_PATTERN.sub(" ", text).strip()  # strip multi-whitespaces
+
+
+def _merge_short_supervisions(
+    sups: list[SupervisionSegment], frame_length: Seconds, sampling_rate: int, min_sup_frames: int
+) -> list[SupervisionSegment]:
+    """
+    Merges supervisions whose frame span cannot hold ``^ text *`` into a neighbour.
+
+    A short supervision is merged *forward* into the next one (typically a lead-in word such as "dans"
+    before "l'unite ..."), cascading over consecutive short ones. A short *last* supervision is merged
+    *backward* into the previous one. A lone short supervision is left as is (it is skipped later).
+    ``sups`` is expected to be already filtered by role; the input list and its segments are not modified.
+    """
+    if min_sup_frames <= 0 or len(sups) < 2:
+        return sups
+    merged: list[SupervisionSegment] = []
+    pending = None
+    for i, sup in enumerate(sups):
+        if pending is not None:
+            sup, pending = _join_supervisions(pending, sup), None
+        is_last = i == len(sups) - 1
+        if _frame_span(sup, frame_length, sampling_rate) >= min_sup_frames + (not merged) + is_last:
+            merged.append(sup)
+        elif not is_last:
+            pending = sup
+        elif merged:
+            merged[-1] = _join_supervisions(merged[-1], sup)
+        else:
+            merged.append(sup)
+    return merged
+
+
+def _frame_span(sup: SupervisionSegment, frame_length: Seconds, sampling_rate: int) -> int:
+    start_pos = max(compute_num_frames(sup.start, frame_length, sampling_rate), 1)
+    return compute_num_frames(sup.end, frame_length, sampling_rate) - start_pos
+
+
+def _join_supervisions(first: SupervisionSegment, second: SupervisionSegment) -> SupervisionSegment:
+    return fastcopy(
+        first,
+        duration=max(first.end, second.end) - first.start,
+        text=f"{first.text} {second.text}".strip(),
+        alignment=None,  # word alignments no longer describe the merged span
+    )
+
+
+def _count(stats: dict | None, **increments: int) -> None:
+    if stats is not None:
+        for name, value in increments.items():
+            stats[name] = stats.get(name, 0) + value
+
+
+def _log_token_stats(token_stats: dict[str, dict], num_batches: int) -> None:
+    for channel, stats in token_stats.items():
+        phrases = stats.get("phrases", 0)
+        truncated = stats.get("truncated", 0)
+        logging.info(
+            f"[s2s_st_dataset_concat_v1_1] {channel} token channel after {num_batches} batches (this worker): "
+            f"{phrases} phrases, {truncated} truncated ({truncated / max(phrases, 1):.2%}), "
+            f"{stats.get('dropped_tokens', 0)} text tokens dropped, {stats.get('skipped', 0)} phrases skipped"
+        )

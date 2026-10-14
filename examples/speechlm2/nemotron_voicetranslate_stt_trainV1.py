@@ -38,7 +38,7 @@ from nemo.core.config import hydra_runner
 from nemo.utils.exp_manager import exp_manager
 from nemo.utils.trainer_utils import resolve_trainer_cfg
 
-# torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
 
 @hydra_runner(config_path="conf", config_name="nemotron_voicetranslate_stt")
@@ -63,6 +63,7 @@ def train(cfg):
         output_roles=cfg.data.output_roles,
         add_lang_prompt=cfg.data.get("add_lang_prompt", False),
         lang_map=cfg.data.get("lang_map", None),
+        min_sup_frames=cfg.data.get("min_sup_frames", 3),
     )
     datamodule = DataModule(cfg.data, tokenizer=model.tokenizer, dataset=dataset)
 
